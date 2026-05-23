@@ -16,11 +16,14 @@ struct Vertex {
 	DirectX::XMFLOAT3 Pos;
 	DirectX::XMFLOAT3 Normal;
 	DirectX::XMFLOAT4 Color;
+	DirectX::XMFLOAT2 TexCoord = { 0.0f, 0.0f };  // UV (offset 40, stride = 48)
 };
 
 struct alignas(16) ObjectConstants {
-	DirectX::XMFLOAT4X4 World = dx::Identity4x4();
+	DirectX::XMFLOAT4X4 World             = dx::Identity4x4();
 	DirectX::XMFLOAT4X4 WorldInvTranspose = dx::Identity4x4();
+	DirectX::XMFLOAT2   UvScale           = { 1.0f, 1.0f };  // тайлинг
+	DirectX::XMFLOAT2   UvOffset          = { 0.0f, 0.0f };  // анимация UV
 };
 
 struct alignas(16) PassConstants {
