@@ -1389,7 +1389,19 @@ void Framework::BuildObjVB_Upload()
 	if (!err.empty())  OutputDebugStringA(("[tinyobj err ] " + err  + "\n").c_str());
 	if (!ok)
 	{
-		OutputDebugStringA("[OBJ] LoadObj failed — falling back to box geometry.\n");
+		// Получаем абсолютный путь, чтобы показать пользователю, куда класть файл
+		wchar_t absPathBuf[MAX_PATH] = {};
+		GetFullPathNameW(objPathW.c_str(), MAX_PATH, absPathBuf, nullptr);
+
+		std::wstring msg =
+			L"Не удалось загрузить OBJ-модель.\n\n"
+			L"Ожидаемый путь:\n  " + std::wstring(absPathBuf) +
+			L"\n\nСкопируйте папку assets\\ (sponza.obj, sponza.mtl, textures\\*.dds)"
+			L" рядом с файлом Lab4.vcxproj и перезапустите программу.\n\n"
+			L"Пока что отображается куб-заглушка.";
+
+		OutputDebugStringW((msg + L"\n").c_str());
+		MessageBoxW(nullptr, msg.c_str(), L"Ресурсы не найдены", MB_OK | MB_ICONWARNING);
 		return;   // m_subMeshes остаётся пустым, Draw() нарисует куб
 	}
 
