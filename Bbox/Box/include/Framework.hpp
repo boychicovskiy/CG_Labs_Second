@@ -167,8 +167,11 @@ private:
 	// --- UV animation ---
 	DirectX::XMFLOAT2 m_uvOffset    = { 0.0f, 0.0f };
 	DirectX::XMFLOAT2 m_uvTile      = { 1.0f, 1.0f };
-	float             m_uvAnimSpeed = 0.05f;        // units/sec по оси U
-	std::array<bool, 256> m_keyDown{}; // ��������� VK_*
+	float             m_uvAnimSpeed = 0.3f;         // units/sec по оси U (видимая скорость)
+	bool              m_uvAnimEnabled = true;        // T — вкл/выкл
+
+	std::array<bool, 256> m_keyDown{};              // текущее состояние VK_*
+	std::array<bool, 256> m_keyDownPrev{};          // состояние прошлого кадра (для edge-detect)
 
 	float m_cameraMoveSpeed = 3.0f;   // units/sec, �������� ��� �����
 

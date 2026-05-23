@@ -324,12 +324,47 @@ void Framework::Update(const double& dt)
 	XMStoreFloat4x4(&obj.World, XMMatrixTranspose(world));
 	XMStoreFloat4x4(&obj.WorldInvTranspose, worldInvTranspose);
 
+	// ── Определяем «только что нажата» (rising edge) ────────────────────────
+	auto JustPressed = [&](uint8_t vk) {
+		return m_keyDown[vk] && !m_keyDownPrev[vk];
+	};
+
+	// T — вкл/выкл UV-анимацию
+	if (JustPressed('T')) {
+		m_uvAnimEnabled = !m_uvAnimEnabled;
+		OutputDebugStringA(m_uvAnimEnabled
+			? "[UV] Animation ON\n"
+			: "[UV] Animation OFF\n");
+	}
+
+	// [ — тайлинг ÷2    ] — тайлинг ×2
+	if (JustPressed(VK_OEM_4)) {          // [ (уменьшить)
+		m_uvTile.x *= 0.5f;
+		m_uvTile.y *= 0.5f;
+	}
+	if (JustPressed(VK_OEM_6)) {          // ] (увеличить)
+		m_uvTile.x *= 2.0f;
+		m_uvTile.y *= 2.0f;
+	}
+
+	// 0 — сбросить тайлинг и смещение
+	if (JustPressed('0')) {
+		m_uvTile   = { 1.0f, 1.0f };
+		m_uvOffset = { 0.0f, 0.0f };
+		OutputDebugStringA("[UV] Reset tile=1 offset=0\n");
+	}
+
 	// UV-анимация: смещение по оси U
-	m_uvOffset.x += m_uvAnimSpeed * static_cast<float>(dt);
-	if (m_uvOffset.x > 1.0f) m_uvOffset.x -= 1.0f;
+	if (m_uvAnimEnabled) {
+		m_uvOffset.x += m_uvAnimSpeed * static_cast<float>(dt);
+		if (m_uvOffset.x > 1.0f) m_uvOffset.x -= 1.0f;
+	}
 
 	obj.UvOffset = m_uvOffset;
 	obj.UvScale  = m_uvTile;
+
+	// Сохраняем состояние клавиш для следующего кадра
+	m_keyDownPrev = m_keyDown;
 
 	m_objectCB->CopyData(0, obj);
 
