@@ -4,6 +4,7 @@
 #include <DirectXMath.h>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cmath>
 #include <string>
 
@@ -75,6 +76,7 @@ int Framework::Run() {
 			const double dt = m_timer.DeltaTime();
 			Update(dt);
 			Draw();
+			UpdateWindowTitle(dt);
 		}
 		else {
 			Sleep(100);
@@ -359,6 +361,46 @@ void Framework::HandleKeyboardShortcuts()
 
 	if (JustPressed(VK_PRIOR)) m_renderer->ScaleMaxTessFactor(+1.0f);       // PageUp
 	if (JustPressed(VK_NEXT))  m_renderer->ScaleMaxTessFactor(-1.0f);       // PageDown
+
+	// ── ДЗ №4: режимы отсечения ─────────────────────────────────────────────
+	if (JustPressed('1')) m_renderer->SetCullMode(CullMode::Disabled);
+	if (JustPressed('2')) m_renderer->SetCullMode(CullMode::BruteForce);
+	if (JustPressed('3')) m_renderer->SetCullMode(CullMode::Octree);
+	if (JustPressed('O')) m_renderer->ToggleOctreeBoxes();
+	if (JustPressed('P')) m_renderer->ToggleFrustumFreeze();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Счётчики в заголовке окна: FPS, режим отсечения, сколько объектов осталось
+// после отбраковки и во сколько тестов это обошлось.
+// ═════════════════════════════════════════════════════════════════════════════
+void Framework::UpdateWindowTitle(double dt)
+{
+	m_titleAccum += dt;
+	m_titleFrames += 1;
+
+	if (m_titleAccum < 0.5 || !m_renderer)
+		return;
+
+	const double fps = m_titleFrames / m_titleAccum;
+	m_titleAccum  = 0.0;
+	m_titleFrames = 0;
+
+	const CullStats& s = m_renderer->FieldStats();
+
+	const wchar_t* modeName =
+		(m_renderer->GetCullMode() == CullMode::Disabled)   ? L"OFF" :
+		(m_renderer->GetCullMode() == CullMode::BruteForce) ? L"brute" : L"octree";
+
+	const wchar_t* frozen = m_renderer->FrustumFrozen() ? L"  |  FRUSTUM FROZEN (P)" : L"";
+
+	wchar_t buf[320];
+	swprintf_s(buf, L"CG Lab  |  %.0f FPS  |  cull: %s  |  drawn %u / %u  |  AABB tests %u  |  %.3f ms  |  octree %zu nodes, depth %d%s",
+	           fps, modeName, s.drawnObjects, s.totalObjects, s.aabbTests, s.cullMs,
+	           m_renderer->OctreeNodeCount(), m_renderer->OctreeDepth(), frozen);
+
+	if (HWND hwnd = MainWnd())
+		SetWindowTextW(hwnd, buf);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -88,6 +88,22 @@ void RenderingSystem::Init(ID3D12Device* device,
 	BuildMaterialSrvHeap(device);
 	BuildLights();
 	BuildConstantBuffers(device);
+
+	// ── ДЗ №4: поле объектов вокруг сцены ───────────────────────────────────
+	// Область заметно больше самой Sponza, чтобы за пределами пирамиды
+	// видимости всегда оставалась заметная доля объектов — иначе выигрыш
+	// от отсечения не на чем показывать.
+	{
+		const float halfX = 0.5f * (m_boundsMax.x - m_boundsMin.x) * m_modelScale;
+		const float halfY = 0.5f * (m_boundsMax.y - m_boundsMin.y) * m_modelScale;
+		const float halfZ = 0.5f * (m_boundsMax.z - m_boundsMin.z) * m_modelScale;
+
+		AABB region;
+		region.Min = { -2.5f * std::max(halfX, 0.5f), -1.0f * std::max(halfY, 0.5f), -2.5f * std::max(halfZ, 0.5f) };
+		region.Max = { +2.5f * std::max(halfX, 0.5f), +2.5f * std::max(halfY, 0.5f), +2.5f * std::max(halfZ, 0.5f) };
+
+		m_objectField.Init(device, region, /*objectCount*/ 4096, m_depthStencilFormat);
+	}
 }
 
 void RenderingSystem::FlushUploads(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd)
@@ -1124,6 +1140,16 @@ void RenderingSystem::Update(double dt,
 		lc.Intensity *= m_lightIntensityScale;
 		m_lightCB->CopyData(static_cast<int>(i), lc);
 	}
+
+	// ── ДЗ №4: отсечение поля объектов ──────────────────────────────────────
+	// Запоминаем последнюю матрицу, чтобы было что «заморозить».
+	XMStoreFloat4x4(&m_lastViewProj, viewProj);
+
+	const XMMATRIX cullViewProj = m_freezeFrustum
+		? XMLoadFloat4x4(&m_frozenViewProj)
+		: viewProj;
+
+	m_objectField.Update(viewProj, cullViewProj, m_cullMode);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1200,6 +1226,11 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 		DrawGroup(false);
 		DrawGroup(true);
 	}
+
+	// Поле объектов пишется в тот же G-Buffer, поэтому освещается общими
+	// источниками света. Оно меняет root signature и PSO, но световой проход
+	// ниже всё равно ставит свои.
+	m_objectField.Render(cmd);
 
 	// ═══════════════════════════════════════════════════════════════════════
 	// ПРОХОД 2: Light Stage → аккумулируем освещение в back buffer
@@ -1320,6 +1351,33 @@ void RenderingSystem::ScaleDisplacement(float factor)
 	sprintf_s(buf, "[TESS] Displacement scale = %.4f\n", m_displacementScale);
 	OutputDebugStringA(buf);
 #endif
+}
+
+void RenderingSystem::SetCullMode(CullMode mode)
+{
+	m_cullMode = mode;
+
+	const char* name =
+		(mode == CullMode::Disabled)   ? "[CULL] OFF (draw everything)\n" :
+		(mode == CullMode::BruteForce) ? "[CULL] Brute force frustum culling\n" :
+		                                 "[CULL] Frustum culling + octree\n";
+	OutputDebugStringA(name);
+}
+
+void RenderingSystem::ToggleFrustumFreeze()
+{
+	m_freezeFrustum = !m_freezeFrustum;
+
+	if (m_freezeFrustum)
+	{
+		// Фиксируем пирамиду в текущем положении камеры
+		m_frozenViewProj = m_lastViewProj;
+		OutputDebugStringA("[CULL] Frustum FROZEN — fly away to see what was culled\n");
+	}
+	else
+	{
+		OutputDebugStringA("[CULL] Frustum follows camera again\n");
+	}
 }
 
 void RenderingSystem::ScaleMaxTessFactor(float delta)

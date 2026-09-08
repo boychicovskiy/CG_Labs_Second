@@ -138,6 +138,11 @@ private:
 	void CreateSwapChain();
 
 	void HandleKeyboardShortcuts();
+	void UpdateWindowTitle(double dt);
+
+	// Накопители для усреднения FPS в заголовке окна
+	double m_titleAccum  = 0.0;
+	int    m_titleFrames = 0;
 
 	ID3D12Resource* CurrentBackBuffer() const {
 		return m_swapChainBuffer[m_currBackBuffer].Get();

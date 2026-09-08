@@ -10,6 +10,7 @@
 #include "UploadBuffer.hpp"
 #include "RenderStructs.hpp"
 #include "GBuffer.hpp"
+#include "ObjectField.hpp"
 
 // Диапазон вершин с одним материалом
 struct SubMesh {
@@ -95,6 +96,20 @@ public:
 	void ToggleHullBackfaceCulling();
 	void ScaleDisplacement(float factor);
 	void ScaleMaxTessFactor(float delta);
+
+	// ── ДЗ №4 ───────────────────────────────────────────────────────────────
+	void     SetCullMode(CullMode mode);
+	CullMode GetCullMode() const { return m_cullMode; }
+	void     ToggleOctreeBoxes() { m_objectField.ToggleNodeBoxes(); }
+
+	// «Заморозка» пирамиды видимости — единственный способ увидеть отсечение
+	// глазами: пирамида остаётся на месте, камера улетает в сторону.
+	void ToggleFrustumFreeze();
+	bool FrustumFrozen() const { return m_freezeFrustum; }
+
+	const CullStats& FieldStats()   const { return m_objectField.Stats(); }
+	size_t OctreeNodeCount()        const { return m_objectField.OctreeNodeCount(); }
+	int    OctreeDepth()            const { return m_objectField.OctreeDepth(); }
 
 	bool SceneLoaded() const { return !m_subMeshes.empty(); }
 	size_t LightCount() const { return m_lights.size(); }
@@ -202,6 +217,14 @@ private:
 	float m_tessFactorMax     = 8.0f;
 	float m_tessDistNear      = 0.25f;
 	float m_tessDistFar       = 3.00f;
+
+	// ── Поле объектов и отсечение (ДЗ №4) ───────────────────────────────────
+	ObjectField m_objectField;
+	CullMode    m_cullMode = CullMode::Octree;
+
+	bool              m_freezeFrustum  = false;
+	DirectX::XMFLOAT4X4 m_frozenViewProj = dx::Identity4x4();
+	DirectX::XMFLOAT4X4 m_lastViewProj   = dx::Identity4x4();
 
 	// Синхронизация для одноразовых загрузок
 	ComPtr<ID3D12Fence> m_uploadFence;
