@@ -130,6 +130,8 @@
   <ItemGroup>
     <ClCompile Include="src\DDSTextureLoader.cpp" />
     <ClCompile Include="src\Framework.cpp" />
+    <ClCompile Include="src\GBuffer.cpp" />
+    <ClCompile Include="src\RenderingSystem.cpp" />
     <ClCompile Include="src\Timer.cpp" />
     <ClCompile Include="src\Window.cpp" />
     <ClCompile Include="src\winMain.cpp" />
@@ -139,6 +141,8 @@
     <ClInclude Include="include\DDSTextureLoader.h" />
     <ClInclude Include="include\Dx12Common.hpp" />
     <ClInclude Include="include\Framework.hpp" />
+    <ClInclude Include="include\GBuffer.hpp" />
+    <ClInclude Include="include\RenderingSystem.hpp" />
     <ClInclude Include="include\RenderStructs.hpp" />
     <ClInclude Include="include\Timer.hpp" />
     <ClInclude Include="include\tiny_obj_loader.h" />
@@ -146,6 +150,12 @@
     <ClInclude Include="include\Window.hpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="shader\GeometryPass.hlsl">
+      <FileType>Document</FileType>
+    </None>
+    <None Include="shader\LightPass.hlsl">
+      <FileType>Document</FileType>
+    </None>
     <None Include="shader\Phong.hlsl">
       <DisableOptimizations Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</DisableOptimizations>
       <EnableDebuggingInformation Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</EnableDebuggingInformation>

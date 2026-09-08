@@ -2,6 +2,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif // !WIN32_LEAN_AND_MEAN
 
+// Windows.h defines min/max macros that break std::min / std::max.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif // !NOMINMAX
+
 
 #ifndef DX_12_COMMON_HPP
 #define DX_12_COMMON_HPP

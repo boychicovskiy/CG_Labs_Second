@@ -1,0 +1,1054 @@
+﻿// Windows.h min/max macros collide with std::min / std::max.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include "RenderingSystem.hpp"
+
+#include <DirectXColors.h>
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tiny_obj_loader.h"
+
+#include "d3dx12.h"            // UpdateSubresources
+#include "DDSTextureLoader.h"
+
+using namespace DirectX;
+
+namespace {
+	const std::wstring kObjPathW  = L"assets\\sponza.obj";
+	const std::wstring kAssetDirW = L"assets\\";
+
+	std::string WideToUtf8(const std::wstring& w)
+	{
+		if (w.empty()) return {};
+		int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		std::string s((n > 0) ? (n - 1) : 0, '\0');
+		if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+		return s;
+	}
+
+	std::wstring Utf8ToWide(const std::string& s)
+	{
+		if (s.empty()) return {};
+		int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+		std::wstring w((n > 0) ? (n - 1) : 0, L'\0');
+		if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+		return w;
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Init
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::Init(ID3D12Device* device,
+                           ID3D12CommandQueue* cmdQueue,
+                           ID3D12CommandAllocator* cmdAlloc,
+                           ID3D12GraphicsCommandList* cmdList,
+                           DXGI_FORMAT backBufferFormat,
+                           DXGI_FORMAT depthStencilFormat)
+{
+	m_backBufferFormat   = backBufferFormat;
+	m_depthStencilFormat = depthStencilFormat;
+
+	m_srvDescSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	ThrowIfFailed(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_uploadFence)));
+
+	BuildShaders();
+	BuildGeometryRootSignature(device);
+	BuildLightRootSignature(device);
+	BuildGeometryPSO(device);
+	BuildLightPSO(device);
+
+	m_gbuffer.Init(device);
+
+	// ── Одноразовая заливка текстур и вершинного буфера ─────────────────────
+	// uploadKeepAlive держит промежуточные UPLOAD-ресурсы живыми до тех пор,
+	// пока GPU не выполнит команды копирования.
+	std::vector<ComPtr<ID3D12Resource>> uploadKeepAlive;
+
+	ThrowIfFailed(cmdAlloc->Reset());
+	ThrowIfFailed(cmdList->Reset(cmdAlloc, nullptr));
+
+	CreateWhiteTexture(device, cmdList, uploadKeepAlive);
+	LoadScene(device, cmdList, uploadKeepAlive);
+
+	FlushUploads(cmdQueue, cmdList);
+	uploadKeepAlive.clear();   // GPU закончил — можно освобождать
+
+	BuildMaterialSrvHeap(device);
+	BuildLights();
+	BuildConstantBuffers(device);
+}
+
+void RenderingSystem::FlushUploads(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd)
+{
+	ThrowIfFailed(cmd->Close());
+	ID3D12CommandList* lists[] = { cmd };
+	queue->ExecuteCommandLists(1, lists);
+
+	++m_uploadFenceValue;
+	ThrowIfFailed(queue->Signal(m_uploadFence.Get(), m_uploadFenceValue));
+
+	if (m_uploadFence->GetCompletedValue() < m_uploadFenceValue)
+	{
+		HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+		ThrowIfFailed(m_uploadFence->SetEventOnCompletion(m_uploadFenceValue, evt));
+		WaitForSingleObject(evt, INFINITE);
+		CloseHandle(evt);
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Шейдеры
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildShaders()
+{
+	const std::wstring geoFile   = L"shader\\GeometryPass.hlsl";
+	const std::wstring lightFile = L"shader\\LightPass.hlsl";
+
+	m_geoVS = CompileShader(geoFile, nullptr, "VS", "vs_5_1");
+	m_geoPS = CompileShader(geoFile, nullptr, "PS", "ps_5_1");
+
+	m_lightVS = CompileShader(lightFile, nullptr, "VS", "vs_5_1");
+	m_lightPS = CompileShader(lightFile, nullptr, "PS", "ps_5_1");
+	m_debugPS = CompileShader(lightFile, nullptr, "PS_Debug", "ps_5_1");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Root signature геометрического прохода
+//   b0 — ObjectCB   (root CBV, VS)
+//   b1 — GeoPassCB  (root CBV, VS)
+//   b2 — MaterialCB (root CBV, ALL: VS берёт UV, PS — Kd/Ks/Ns)
+//   t0..t1 — descriptor table: diffuse + alpha mask (PS)
+//   s0 — статический сэмплер (лекция 02, слайд 41)
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildGeometryRootSignature(ID3D12Device* device)
+{
+	D3D12_DESCRIPTOR_RANGE srvRange = {};
+	srvRange.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	srvRange.NumDescriptors                    = 2;   // t0 = diffuse, t1 = alpha
+	srvRange.BaseShaderRegister                = 0;
+	srvRange.RegisterSpace                     = 0;
+	srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER params[4] = {};
+
+	params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	params[0].Descriptor.ShaderRegister = 0;
+	params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+
+	params[1].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	params[1].Descriptor.ShaderRegister = 1;
+	params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+
+	params[2].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	params[2].Descriptor.ShaderRegister = 2;
+	params[2].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+	params[3].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[3].DescriptorTable.NumDescriptorRanges = 1;
+	params[3].DescriptorTable.pDescriptorRanges   = &srvRange;
+	params[3].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_STATIC_SAMPLER_DESC sampler = {};
+	sampler.Filter           = D3D12_FILTER_ANISOTROPIC;
+	sampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+	sampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+	sampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+	sampler.MipLODBias       = 0.0f;
+	sampler.MaxAnisotropy    = 8;
+	sampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_ALWAYS;
+	sampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+	sampler.MinLOD           = 0.0f;
+	sampler.MaxLOD           = D3D12_FLOAT32_MAX;
+	sampler.ShaderRegister   = 0;
+	sampler.RegisterSpace    = 0;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC desc = {};
+	desc.NumParameters     = _countof(params);
+	desc.pParameters       = params;
+	desc.NumStaticSamplers = 1;
+	desc.pStaticSamplers   = &sampler;
+	desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+	ComPtr<ID3DBlob> blob, errors;
+	HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1,
+	                                         blob.GetAddressOf(), errors.GetAddressOf());
+	if (errors) OutputDebugStringA((const char*)errors->GetBufferPointer());
+	ThrowIfFailed(hr);
+
+	ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+	                                          IID_PPV_ARGS(&m_geoRootSig)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Root signature светового прохода
+//   b0 — LightPassCB (root CBV, ALL)
+//   b1 — LightCB     (root CBV, PS) — меняется на каждый источник
+//   t0..t3 — descriptor table: albedo, normal, specular, depth (PS)
+//   Сэмплер не нужен: читаем через Texture2D.Load (лекция 03, слайд 20)
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildLightRootSignature(ID3D12Device* device)
+{
+	D3D12_DESCRIPTOR_RANGE srvRange = {};
+	srvRange.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	srvRange.NumDescriptors                    = GBuffer::SrvCount;   // 4
+	srvRange.BaseShaderRegister                = 0;
+	srvRange.RegisterSpace                     = 0;
+	srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER params[3] = {};
+
+	params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	params[0].Descriptor.ShaderRegister = 0;
+	params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+	params[1].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	params[1].Descriptor.ShaderRegister = 1;
+	params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	params[2].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[2].DescriptorTable.NumDescriptorRanges = 1;
+	params[2].DescriptorTable.pDescriptorRanges   = &srvRange;
+	params[2].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC desc = {};
+	desc.NumParameters     = _countof(params);
+	desc.pParameters       = params;
+	desc.NumStaticSamplers = 0;
+	desc.pStaticSamplers   = nullptr;
+	// Input layout не нужен — вершины генерирует VS из SV_VertexID.
+	desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+	ComPtr<ID3DBlob> blob, errors;
+	HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1,
+	                                         blob.GetAddressOf(), errors.GetAddressOf());
+	if (errors) OutputDebugStringA((const char*)errors->GetBufferPointer());
+	ThrowIfFailed(hr);
+
+	ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+	                                          IID_PPV_ARGS(&m_lightRootSig)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PSO геометрического прохода: 3 render target'а (лекция 03, слайд 19)
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildGeometryPSO(ID3D12Device* device)
+{
+	D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+	{
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+	};
+
+	D3D12_RASTERIZER_DESC raster = {};
+	raster.FillMode              = D3D12_FILL_MODE_SOLID;
+	// NONE, а не BACK: в Sponza листва и ткани — односторонние полигоны,
+	// при back-face culling половина из них исчезает.
+	raster.CullMode              = D3D12_CULL_MODE_NONE;
+	raster.FrontCounterClockwise = FALSE;
+	raster.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+	raster.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+	raster.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+	raster.DepthClipEnable       = TRUE;
+	raster.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+	D3D12_BLEND_DESC blend = {};
+	blend.AlphaToCoverageEnable  = FALSE;
+	blend.IndependentBlendEnable = FALSE;
+	for (UINT i = 0; i < GBuffer::RT_Count; ++i)
+	{
+		blend.RenderTarget[i].BlendEnable           = FALSE;
+		blend.RenderTarget[i].LogicOpEnable         = FALSE;
+		blend.RenderTarget[i].SrcBlend              = D3D12_BLEND_ONE;
+		blend.RenderTarget[i].DestBlend             = D3D12_BLEND_ZERO;
+		blend.RenderTarget[i].BlendOp               = D3D12_BLEND_OP_ADD;
+		blend.RenderTarget[i].SrcBlendAlpha         = D3D12_BLEND_ONE;
+		blend.RenderTarget[i].DestBlendAlpha        = D3D12_BLEND_ZERO;
+		blend.RenderTarget[i].BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+		blend.RenderTarget[i].LogicOp               = D3D12_LOGIC_OP_NOOP;
+		blend.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	}
+
+	D3D12_DEPTH_STENCIL_DESC ds = {};
+	ds.DepthEnable      = TRUE;
+	ds.DepthWriteMask   = D3D12_DEPTH_WRITE_MASK_ALL;
+	ds.DepthFunc        = D3D12_COMPARISON_FUNC_LESS;
+	ds.StencilEnable    = FALSE;
+	ds.StencilReadMask  = D3D12_DEFAULT_STENCIL_READ_MASK;
+	ds.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+	ds.FrontFace.StencilFailOp      = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilPassOp      = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilFunc        = D3D12_COMPARISON_FUNC_ALWAYS;
+	ds.BackFace = ds.FrontFace;
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+	pso.InputLayout           = { inputLayout, _countof(inputLayout) };
+	pso.pRootSignature        = m_geoRootSig.Get();
+	pso.VS                    = { m_geoVS->GetBufferPointer(), m_geoVS->GetBufferSize() };
+	pso.PS                    = { m_geoPS->GetBufferPointer(), m_geoPS->GetBufferSize() };
+	pso.RasterizerState       = raster;
+	pso.BlendState            = blend;
+	pso.DepthStencilState     = ds;
+	pso.SampleMask            = D3D12_DEFAULT_SAMPLE_MASK;
+	pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	pso.NumRenderTargets      = GBuffer::RT_Count;
+	for (UINT i = 0; i < GBuffer::RT_Count; ++i)
+		pso.RTVFormats[i] = GBuffer::Format(i);
+	pso.DSVFormat             = m_depthStencilFormat;
+	pso.SampleDesc.Count      = 1;
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_geoPSO)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PSO светового прохода: аддитивный блендинг, глубина выключена
+// (лекция 03, слайды 11 и 13)
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildLightPSO(ID3D12Device* device)
+{
+	D3D12_RASTERIZER_DESC raster = {};
+	raster.FillMode             = D3D12_FILL_MODE_SOLID;
+	raster.CullMode             = D3D12_CULL_MODE_NONE;
+	raster.DepthClipEnable      = TRUE;
+	raster.ConservativeRaster   = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+	// Накопление яркости: Final = Src * 1 + Dest * 1  (слайд 36)
+	D3D12_BLEND_DESC additive = {};
+	additive.RenderTarget[0].BlendEnable           = TRUE;
+	additive.RenderTarget[0].LogicOpEnable         = FALSE;
+	additive.RenderTarget[0].SrcBlend              = D3D12_BLEND_ONE;
+	additive.RenderTarget[0].DestBlend             = D3D12_BLEND_ONE;
+	additive.RenderTarget[0].BlendOp               = D3D12_BLEND_OP_ADD;
+	additive.RenderTarget[0].SrcBlendAlpha         = D3D12_BLEND_ONE;
+	additive.RenderTarget[0].DestBlendAlpha        = D3D12_BLEND_ZERO;
+	additive.RenderTarget[0].BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+	additive.RenderTarget[0].LogicOp               = D3D12_LOGIC_OP_NOOP;
+	additive.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+	// Depth-буфер сейчас привязан как SRV (t3), поэтому DSV не ставим вовсе.
+	D3D12_DEPTH_STENCIL_DESC ds = {};
+	ds.DepthEnable   = FALSE;
+	ds.StencilEnable = FALSE;
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+	pso.InputLayout           = { nullptr, 0 };
+	pso.pRootSignature        = m_lightRootSig.Get();
+	pso.VS                    = { m_lightVS->GetBufferPointer(), m_lightVS->GetBufferSize() };
+	pso.PS                    = { m_lightPS->GetBufferPointer(), m_lightPS->GetBufferSize() };
+	pso.RasterizerState       = raster;
+	pso.BlendState            = additive;
+	pso.DepthStencilState     = ds;
+	pso.SampleMask            = D3D12_DEFAULT_SAMPLE_MASK;
+	pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	pso.NumRenderTargets      = 1;
+	pso.RTVFormats[0]         = m_backBufferFormat;
+	pso.DSVFormat             = DXGI_FORMAT_UNKNOWN;
+	pso.SampleDesc.Count      = 1;
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_lightPSO)));
+
+	// Отладочный PSO: тот же VS, другой PS, блендинг выключен —
+	// показывает содержимое одного таргета G-Buffer на весь экран.
+	D3D12_BLEND_DESC opaque = {};
+	opaque.RenderTarget[0].BlendEnable           = FALSE;
+	opaque.RenderTarget[0].SrcBlend              = D3D12_BLEND_ONE;
+	opaque.RenderTarget[0].DestBlend             = D3D12_BLEND_ZERO;
+	opaque.RenderTarget[0].BlendOp               = D3D12_BLEND_OP_ADD;
+	opaque.RenderTarget[0].SrcBlendAlpha         = D3D12_BLEND_ONE;
+	opaque.RenderTarget[0].DestBlendAlpha        = D3D12_BLEND_ZERO;
+	opaque.RenderTarget[0].BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+	opaque.RenderTarget[0].LogicOp               = D3D12_LOGIC_OP_NOOP;
+	opaque.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+	pso.PS         = { m_debugPS->GetBufferPointer(), m_debugPS->GetBufferSize() };
+	pso.BlendState = opaque;
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_debugPSO)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Константные буферы
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildConstantBuffers(ID3D12Device* device)
+{
+	m_objectCB    = std::make_unique<UploadBuffer<ObjectConstants>>(device, 1, true);
+	m_geoPassCB   = std::make_unique<UploadBuffer<GeoPassConstants>>(device, 1, true);
+	m_lightPassCB = std::make_unique<UploadBuffer<LightPassConstants>>(device, 1, true);
+
+	const UINT matCount   = std::max<UINT>(1, static_cast<UINT>(m_materials.size()));
+	const UINT lightCount = std::max<UINT>(1, static_cast<UINT>(m_lights.size()));
+
+	m_materialCB = std::make_unique<UploadBuffer<MaterialConstants>>(device, matCount, true);
+	m_lightCB    = std::make_unique<UploadBuffer<LightConstants>>(device, lightCount, true);
+
+	// Root CBV требует выравнивания адреса на 256 байт, поэтому шаг между
+	// элементами — тот же, что использует UploadBuffer при isConstantBuffer.
+	m_materialCBStride = CalcConstantBufferByteSize(sizeof(MaterialConstants));
+	m_lightCBStride    = CalcConstantBufferByteSize(sizeof(LightConstants));
+
+	// Свет статичен — заливаем один раз здесь, а в Update() только
+	// перемножаем на m_lightIntensityScale.
+	for (size_t i = 0; i < m_lights.size(); ++i)
+		m_lightCB->CopyData(static_cast<int>(i), m_lights[i]);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Белая заглушка 1×1 — используется там, где у материала нет карты
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::CreateWhiteTexture(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
+                                         std::vector<ComPtr<ID3D12Resource>>& uploadKeepAlive)
+{
+	D3D12_RESOURCE_DESC texDesc = {};
+	texDesc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	texDesc.Width            = 1;
+	texDesc.Height           = 1;
+	texDesc.DepthOrArraySize = 1;
+	texDesc.MipLevels        = 1;
+	texDesc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+	D3D12_HEAP_PROPERTIES defaultHeap = {};
+	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	ThrowIfFailed(device->CreateCommittedResource(
+		&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_whiteTex)));
+
+	UINT64 uploadSize = 0;
+	device->GetCopyableFootprints(&texDesc, 0, 1, 0, nullptr, nullptr, nullptr, &uploadSize);
+
+	D3D12_RESOURCE_DESC bufDesc = {};
+	bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufDesc.Width            = uploadSize;
+	bufDesc.Height           = 1;
+	bufDesc.DepthOrArraySize = 1;
+	bufDesc.MipLevels        = 1;
+	bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
+	bufDesc.SampleDesc.Count = 1;
+	bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	D3D12_HEAP_PROPERTIES uploadHeap = {};
+	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+	ComPtr<ID3D12Resource> upload;
+	ThrowIfFailed(device->CreateCommittedResource(
+		&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)));
+
+	static const uint8_t whitePixel[4] = { 255, 255, 255, 255 };
+
+	D3D12_SUBRESOURCE_DATA sub = {};
+	sub.pData      = whitePixel;
+	sub.RowPitch   = 4;
+	sub.SlicePitch = 4;
+
+	UpdateSubresources(cmd, m_whiteTex.Get(), upload.Get(), 0, 0, 1, &sub);
+
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource   = m_whiteTex.Get();
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd->ResourceBarrier(1, &barrier);
+
+	uploadKeepAlive.push_back(upload);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Загрузка DDS с кэшем: одна и та же текстура в .mtl встречается у нескольких
+// материалов, ресурс создаём один раз (SRV — по одному на материал, они дёшевы)
+// ═════════════════════════════════════════════════════════════════════════════
+ComPtr<ID3D12Resource> RenderingSystem::LoadTextureCached(
+	ID3D12Device* device,
+	ID3D12GraphicsCommandList* cmd,
+	const std::wstring& path,
+	std::vector<ComPtr<ID3D12Resource>>& uploadKeepAlive)
+{
+	auto it = m_textureCache.find(path);
+	if (it != m_textureCache.end())
+		return it->second;
+
+	ComPtr<ID3D12Resource> texture;
+	ComPtr<ID3D12Resource> uploadHeap;
+
+	HRESULT hr = DirectX::CreateDDSTextureFromFile12(
+		device, cmd, path.c_str(), texture, uploadHeap);
+
+	if (FAILED(hr) || !texture)
+	{
+		OutputDebugStringW((L"[TEX] FAILED (fallback white): " + path + L"\n").c_str());
+		m_textureCache[path] = nullptr;
+		return nullptr;
+	}
+
+	uploadKeepAlive.push_back(uploadHeap);
+	m_textureCache[path] = texture;
+
+#if defined(_DEBUG)
+	OutputDebugStringW((L"[TEX] Loaded: " + path + L"\n").c_str());
+#endif
+
+	return texture;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Загрузка сцены: OBJ + материалы + текстуры + вершинный буфер
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::LoadScene(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
+                                std::vector<ComPtr<ID3D12Resource>>& uploadKeepAlive)
+{
+	// Материал по умолчанию всегда есть — слот 0
+	{
+		Material def;
+		def.name = "<default>";
+		m_materials.push_back(def);
+	}
+
+	const std::string objPath = WideToUtf8(kObjPathW);
+	const std::string baseDir = WideToUtf8(kAssetDirW);
+
+	tinyobj::attrib_t attrib;
+	std::vector<tinyobj::shape_t>    shapes;
+	std::vector<tinyobj::material_t> materials;
+	std::string warn, err;
+
+	bool ok = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+	                           objPath.c_str(), baseDir.c_str(), /*triangulate*/ true);
+
+	if (!warn.empty()) OutputDebugStringA(("[tinyobj warn] " + warn + "\n").c_str());
+	if (!err.empty())  OutputDebugStringA(("[tinyobj err ] " + err  + "\n").c_str());
+
+	if (!ok)
+	{
+		wchar_t absPath[MAX_PATH] = {};
+		GetFullPathNameW(kObjPathW.c_str(), MAX_PATH, absPath, nullptr);
+
+		std::wstring msg =
+			L"Не удалось загрузить OBJ-модель.\n\nОжидаемый путь:\n  " + std::wstring(absPath) +
+			L"\n\nПроверьте, что рабочая папка отладчика = папка проекта\n"
+			L"и рядом лежит assets\\ (sponza.obj, sponza.mtl, textures\\*.dds).";
+
+		MessageBoxW(nullptr, msg.c_str(), L"Ресурсы не найдены", MB_OK | MB_ICONWARNING);
+		return;
+	}
+
+	// ── Материалы: константы из .mtl + текстуры ─────────────────────────────
+	m_materials.reserve(materials.size() + 1);
+
+	for (const auto& m : materials)
+	{
+		Material mat;
+		mat.name = m.name;
+
+		// Kd / Ks / Ns — то, чего не хватало в ДЗ №1
+		mat.constants.DiffuseAlbedo = { m.diffuse[0],  m.diffuse[1],  m.diffuse[2], 1.0f };
+		mat.constants.SpecularColor = { m.specular[0], m.specular[1], m.specular[2] };
+		mat.constants.SpecPower     = (m.shininess > 1.0f) ? m.shininess : 1.0f;
+
+		if (!m.diffuse_texname.empty())
+			mat.diffuseTex = LoadTextureCached(device, cmd,
+				Utf8ToWide(baseDir + m.diffuse_texname), uploadKeepAlive);
+
+		// map_d — маска прозрачности (листва, цепи, растения в Sponza)
+		if (!m.alpha_texname.empty())
+		{
+			mat.alphaTex = LoadTextureCached(device, cmd,
+				Utf8ToWide(baseDir + m.alpha_texname), uploadKeepAlive);
+			mat.constants.AlphaTest = mat.alphaTex ? 1u : 0u;
+		}
+
+		m_materials.push_back(std::move(mat));
+	}
+
+	// ── Вершины, сгруппированные по material_id ─────────────────────────────
+	const bool hasNormals  = !attrib.normals.empty();
+	const bool hasTexcoord = !attrib.texcoords.empty();
+
+	std::unordered_map<int, std::vector<Vertex>> groups;
+
+	XMFLOAT3 minP = { +FLT_MAX, +FLT_MAX, +FLT_MAX };
+	XMFLOAT3 maxP = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+	auto ExpandBounds = [&](const XMFLOAT3& p) {
+		minP.x = std::min(minP.x, p.x); maxP.x = std::max(maxP.x, p.x);
+		minP.y = std::min(minP.y, p.y); maxP.y = std::max(maxP.y, p.y);
+		minP.z = std::min(minP.z, p.z); maxP.z = std::max(maxP.z, p.z);
+	};
+
+	auto ReadPos = [&](int vi) -> XMFLOAT3 {
+		if (vi < 0) return { 0, 0, 0 };
+		return { attrib.vertices[3 * vi + 0], attrib.vertices[3 * vi + 1], attrib.vertices[3 * vi + 2] };
+	};
+	auto ReadNrm = [&](int ni) -> XMFLOAT3 {
+		if (!hasNormals || ni < 0) return { 0, 1, 0 };
+		return { attrib.normals[3 * ni + 0], attrib.normals[3 * ni + 1], attrib.normals[3 * ni + 2] };
+	};
+	auto ReadUV = [&](int ti) -> XMFLOAT2 {
+		if (!hasTexcoord || ti < 0) return { 0.0f, 0.0f };
+		// V переворачиваем: в OBJ ось V идёт снизу вверх, в DirectX — сверху вниз
+		return { attrib.texcoords[2 * ti + 0], 1.0f - attrib.texcoords[2 * ti + 1] };
+	};
+
+	for (const auto& sh : shapes)
+	{
+		size_t indexOffset = 0;
+
+		for (size_t f = 0; f < sh.mesh.num_face_vertices.size(); ++f)
+		{
+			int fv = sh.mesh.num_face_vertices[f];
+			if (fv != 3) { indexOffset += static_cast<size_t>(fv); continue; }
+
+			int matId = (f < sh.mesh.material_ids.size()) ? sh.mesh.material_ids[f] : -1;
+
+			tinyobj::index_t i0 = sh.mesh.indices[indexOffset + 0];
+			tinyobj::index_t i1 = sh.mesh.indices[indexOffset + 1];
+			tinyobj::index_t i2 = sh.mesh.indices[indexOffset + 2];
+
+			XMFLOAT3 p0 = ReadPos(i0.vertex_index);
+			XMFLOAT3 p1 = ReadPos(i1.vertex_index);
+			XMFLOAT3 p2 = ReadPos(i2.vertex_index);
+
+			XMFLOAT3 n0 = ReadNrm(i0.normal_index);
+			XMFLOAT3 n1 = ReadNrm(i1.normal_index);
+			XMFLOAT3 n2 = ReadNrm(i2.normal_index);
+
+			if (!hasNormals || i0.normal_index < 0 || i1.normal_index < 0 || i2.normal_index < 0)
+			{
+				XMVECTOR A = XMLoadFloat3(&p0), B = XMLoadFloat3(&p1), C = XMLoadFloat3(&p2);
+				XMVECTOR fn = XMVector3Normalize(XMVector3Cross(B - A, C - A));
+				XMStoreFloat3(&n0, fn); n1 = n0; n2 = n0;
+			}
+
+			auto& g = groups[matId];
+			g.push_back(Vertex{ p0, n0, XMFLOAT4(1,1,1,1), ReadUV(i0.texcoord_index) });
+			g.push_back(Vertex{ p1, n1, XMFLOAT4(1,1,1,1), ReadUV(i1.texcoord_index) });
+			g.push_back(Vertex{ p2, n2, XMFLOAT4(1,1,1,1), ReadUV(i2.texcoord_index) });
+
+			ExpandBounds(p0); ExpandBounds(p1); ExpandBounds(p2);
+			indexOffset += 3;
+		}
+	}
+
+	// ── Один общий VB + список подмешей ─────────────────────────────────────
+	std::vector<Vertex> vertices;
+	vertices.reserve(400000);
+	m_subMeshes.clear();
+
+	for (auto& kv : groups)
+	{
+		SubMesh sm;
+		sm.vertexOffset = static_cast<UINT>(vertices.size());
+		sm.vertexCount  = static_cast<UINT>(kv.second.size());
+		// material_id из tinyobj → слот в m_materials (0 занят дефолтным)
+		sm.materialSlot = (kv.first >= 0 && kv.first < static_cast<int>(materials.size()))
+			? static_cast<UINT>(kv.first + 1) : 0u;
+
+		m_subMeshes.push_back(sm);
+		vertices.insert(vertices.end(), kv.second.begin(), kv.second.end());
+	}
+
+	if (vertices.empty())
+	{
+		OutputDebugStringA("[SCENE] OBJ loaded but produced 0 vertices.\n");
+		return;
+	}
+
+	m_boundsMin = minP;
+	m_boundsMax = maxP;
+
+	m_modelCenter = { 0.5f * (minP.x + maxP.x), 0.5f * (minP.y + maxP.y), 0.5f * (minP.z + maxP.z) };
+	{
+		float dx = maxP.x - minP.x, dy = maxP.y - minP.y, dz = maxP.z - minP.z;
+		float maxDim = std::max(dx, std::max(dy, dz));
+		m_modelScale = (maxDim > 1e-6f) ? (2.0f / maxDim) : 1.0f;
+	}
+
+	// Вершинный буфер в UPLOAD-куче: модель статична, upload-heap проще
+	// и не требует второго копирования (для лабораторной этого достаточно).
+	m_modelVertexCount = static_cast<UINT>(vertices.size());
+	const UINT vbByteSize = m_modelVertexCount * sizeof(Vertex);
+
+	D3D12_RESOURCE_DESC vbDesc = {};
+	vbDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+	vbDesc.Width            = vbByteSize;
+	vbDesc.Height           = 1;
+	vbDesc.DepthOrArraySize = 1;
+	vbDesc.MipLevels        = 1;
+	vbDesc.Format           = DXGI_FORMAT_UNKNOWN;
+	vbDesc.SampleDesc.Count = 1;
+	vbDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	D3D12_HEAP_PROPERTIES uploadProps = {};
+	uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+	ThrowIfFailed(device->CreateCommittedResource(
+		&uploadProps, D3D12_HEAP_FLAG_NONE, &vbDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_modelVB)));
+
+	void* mapped = nullptr;
+	ThrowIfFailed(m_modelVB->Map(0, nullptr, &mapped));
+	memcpy(mapped, vertices.data(), vbByteSize);
+	m_modelVB->Unmap(0, nullptr);
+
+	m_modelVBV.BufferLocation = m_modelVB->GetGPUVirtualAddress();
+	m_modelVBV.StrideInBytes  = sizeof(Vertex);
+	m_modelVBV.SizeInBytes    = vbByteSize;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SRV-куча материалов: по 2 дескриптора (t0 diffuse, t1 alpha) на материал
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildMaterialSrvHeap(ID3D12Device* device)
+{
+	const UINT slots = static_cast<UINT>(m_materials.size());
+	if (slots == 0) return;
+
+	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+	heapDesc.NumDescriptors = slots * 2;
+	heapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ThrowIfFailed(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_matSrvHeap)));
+
+	D3D12_CPU_DESCRIPTOR_HANDLE handle = m_matSrvHeap->GetCPUDescriptorHandleForHeapStart();
+
+	auto MakeSrv = [&](ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE h)
+	{
+		ID3D12Resource* target = res ? res : m_whiteTex.Get();
+		D3D12_RESOURCE_DESC desc = target->GetDesc();
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Format                        = desc.Format;
+		srv.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv.Texture2D.MostDetailedMip     = 0;
+		srv.Texture2D.MipLevels           = desc.MipLevels;
+		srv.Texture2D.PlaneSlice          = 0;
+		srv.Texture2D.ResourceMinLODClamp = 0.0f;
+
+		device->CreateShaderResourceView(target, &srv, h);
+	};
+
+	for (const auto& mat : m_materials)
+	{
+		MakeSrv(mat.diffuseTex.Get(), handle);
+		handle.ptr += m_srvDescSize;
+
+		MakeSrv(mat.alphaTex.Get(), handle);
+		handle.ptr += m_srvDescSize;
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Источники света: 1 ambient + 1 directional + 5 point + 2 spot
+//
+// Позиции задаются относительно габаритов модели ПОСЛЕ нормализации
+// (world = Translate(-center) * Scale(2/maxDim)), поэтому не зависят от того,
+// в каких единицах экспортирован obj.
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildLights()
+{
+	m_lights.clear();
+
+	const float halfX = 0.5f * (m_boundsMax.x - m_boundsMin.x) * m_modelScale;
+	const float halfY = 0.5f * (m_boundsMax.y - m_boundsMin.y) * m_modelScale;
+	const float halfZ = 0.5f * (m_boundsMax.z - m_boundsMin.z) * m_modelScale;
+
+	// 1) Ambient — отдельный «источник» (лекция 03, слайд 13):
+	//    ambient нельзя прибавлять на каждый свет, иначе сцена пересветится.
+	{
+		LightConstants l;
+		l.Type      = static_cast<uint32_t>(LightType::Ambient);
+		l.Color     = { 1.0f, 1.0f, 1.0f };
+		l.Intensity = 1.0f;
+		m_lights.push_back(l);
+	}
+
+	// 2) Directional — «солнце» сверху-сбоку
+	{
+		LightConstants l;
+		l.Type      = static_cast<uint32_t>(LightType::Directional);
+		l.Color     = { 1.0f, 0.96f, 0.88f };
+		l.Intensity = 0.55f;
+
+		XMVECTOR d = XMVector3Normalize(XMVectorSet(0.45f, -1.0f, 0.30f, 0.0f));
+		XMStoreFloat3(&l.DirectionW, d);
+
+		m_lights.push_back(l);
+	}
+
+	// 3) Точечные — цепочка вдоль длинной оси атриума, чуть выше пола
+	{
+		const XMFLOAT3 colors[5] = {
+			{ 1.00f, 0.45f, 0.25f },   // тёплый оранжевый
+			{ 0.30f, 0.65f, 1.00f },   // холодный синий
+			{ 1.00f, 0.90f, 0.55f },   // жёлтый
+			{ 0.40f, 1.00f, 0.55f },   // зелёный
+			{ 1.00f, 0.35f, 0.70f },   // розовый
+		};
+
+		for (int i = 0; i < 5; ++i)
+		{
+			float t = (i / 4.0f) * 2.0f - 1.0f;    // -1 .. +1
+
+			LightConstants l;
+			l.Type      = static_cast<uint32_t>(LightType::Point);
+			l.Color     = colors[i];
+			l.Intensity = 2.2f;
+			l.PositionW = { t * 0.75f * halfX,
+			                -halfY + 0.30f * (2.0f * halfY),
+			                0.0f };
+			l.Range     = 0.55f * halfY + 0.25f * halfZ;
+
+			m_lights.push_back(l);
+		}
+	}
+
+	// 4) Прожекторы — светят вертикально вниз с уровня галереи
+	{
+		const float outerDeg = 32.0f;
+		const float innerDeg = 18.0f;
+
+		for (int i = 0; i < 2; ++i)
+		{
+			float sign = (i == 0) ? -1.0f : 1.0f;
+
+			LightConstants l;
+			l.Type         = static_cast<uint32_t>(LightType::Spot);
+			l.Color        = { 1.0f, 1.0f, 1.0f };
+			l.Intensity    = 4.0f;
+			l.PositionW    = { sign * 0.35f * halfX, 0.75f * halfY, 0.0f };
+			l.DirectionW   = { 0.0f, -1.0f, 0.0f };
+			l.Range        = 2.0f * halfY;
+			l.SpotCosOuter = cosf(XMConvertToRadians(outerDeg));
+			l.SpotCosInner = cosf(XMConvertToRadians(innerDeg));
+
+			m_lights.push_back(l);
+		}
+	}
+
+#if defined(_DEBUG)
+	char buf[128];
+	sprintf_s(buf, "[LIGHTS] total = %zu (bounds half = %.3f %.3f %.3f)\n",
+	          m_lights.size(), halfX, halfY, halfZ);
+	OutputDebugStringA(buf);
+#endif
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OnResize
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::OnResize(ID3D12Device* device, UINT width, UINT height,
+                               ID3D12Resource* depthBuffer)
+{
+	m_gbuffer.Resize(device, width, height, depthBuffer);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Update — заполнение константных буферов
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::Update(double dt,
+                             const XMMATRIX& view,
+                             const XMMATRIX& proj,
+                             const XMFLOAT3& eyePos,
+                             UINT width, UINT height)
+{
+	if (!m_objectCB) return;
+
+	// ── UV-анимация (перенос из ДЗ №1) ──────────────────────────────────────
+	if (m_uvAnimEnabled)
+	{
+		m_uvOffset.x += m_uvAnimSpeed * static_cast<float>(dt);
+		if (m_uvOffset.x > 1.0f) m_uvOffset.x -= 1.0f;
+	}
+
+	// ── ObjectCB ────────────────────────────────────────────────────────────
+	XMMATRIX world =
+		XMMatrixTranslation(-m_modelCenter.x, -m_modelCenter.y, -m_modelCenter.z) *
+		XMMatrixScaling(m_modelScale, m_modelScale, m_modelScale);
+
+	ObjectConstants obj;
+	XMStoreFloat4x4(&obj.World, XMMatrixTranspose(world));
+
+	// Нормали преобразуются матрицей (W^-1)^T. HLSL при упаковке cbuffer
+	// читает матрицу column-major, поэтому в буфер кладём её транспонированной:
+	// transpose((W^-1)^T) == W^-1. То есть достаточно просто inverse(world).
+	XMStoreFloat4x4(&obj.WorldInvTranspose, XMMatrixInverse(nullptr, world));
+
+	m_objectCB->CopyData(0, obj);
+
+	// ── GeoPassCB ───────────────────────────────────────────────────────────
+	XMMATRIX viewProj = view * proj;
+
+	GeoPassConstants geoPass;
+	XMStoreFloat4x4(&geoPass.ViewProj, XMMatrixTranspose(viewProj));
+	m_geoPassCB->CopyData(0, geoPass);
+
+	// ── MaterialCB: тайлинг/смещение общие, остальное — из .mtl ─────────────
+	for (size_t i = 0; i < m_materials.size(); ++i)
+	{
+		MaterialConstants mc = m_materials[i].constants;
+		mc.UvScale  = m_uvTile;
+		mc.UvOffset = m_uvOffset;
+		m_materialCB->CopyData(static_cast<int>(i), mc);
+	}
+
+	// ── LightPassCB ─────────────────────────────────────────────────────────
+	LightPassConstants lp;
+	XMStoreFloat4x4(&lp.InvViewProj, XMMatrixTranspose(XMMatrixInverse(nullptr, viewProj)));
+	lp.EyePosW       = eyePos;
+	lp.InvScreenSize = { 1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height) };
+	lp.DebugMode     = m_debugMode;
+	lp.AmbientColor  = { 0.10f, 0.10f, 0.13f, 1.0f };
+	m_lightPassCB->CopyData(0, lp);
+
+	// ── LightCB: перезаливаем только если менялась общая яркость ────────────
+	for (size_t i = 0; i < m_lights.size(); ++i)
+	{
+		LightConstants lc = m_lights[i];
+		lc.Intensity *= m_lightIntensityScale;
+		m_lightCB->CopyData(static_cast<int>(i), lc);
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Render — два прохода
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
+                             D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv,
+                             D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+                             const D3D12_VIEWPORT& viewport,
+                             const D3D12_RECT& scissor)
+{
+	cmd->RSSetViewports(1, &viewport);
+	cmd->RSSetScissorRects(1, &scissor);
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// ПРОХОД 1: Opaque Geometry Stage → заполняем G-Buffer
+	// ═══════════════════════════════════════════════════════════════════════
+	m_gbuffer.TransitionToWrite(cmd);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE gbufRtv = m_gbuffer.RtvStart();
+	// TRUE = дескрипторы лежат подряд, достаточно передать первый handle
+	cmd->OMSetRenderTargets(GBuffer::RT_Count, &gbufRtv, TRUE, &dsv);
+	m_gbuffer.Clear(cmd, dsv);
+
+	if (SceneLoaded())
+	{
+		cmd->SetPipelineState(m_geoPSO.Get());
+		cmd->SetGraphicsRootSignature(m_geoRootSig.Get());
+
+		ID3D12DescriptorHeap* matHeaps[] = { m_matSrvHeap.Get() };
+		cmd->SetDescriptorHeaps(1, matHeaps);
+
+		cmd->SetGraphicsRootConstantBufferView(0, m_objectCB->Resource()->GetGPUVirtualAddress());
+		cmd->SetGraphicsRootConstantBufferView(1, m_geoPassCB->Resource()->GetGPUVirtualAddress());
+
+		cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		cmd->IASetVertexBuffers(0, 1, &m_modelVBV);
+
+		const D3D12_GPU_VIRTUAL_ADDRESS matCbBase = m_materialCB->Resource()->GetGPUVirtualAddress();
+		const D3D12_GPU_DESCRIPTOR_HANDLE srvBase = m_matSrvHeap->GetGPUDescriptorHandleForHeapStart();
+
+		for (const auto& sm : m_subMeshes)
+		{
+			cmd->SetGraphicsRootConstantBufferView(
+				2, matCbBase + static_cast<UINT64>(sm.materialSlot) * m_materialCBStride);
+
+			D3D12_GPU_DESCRIPTOR_HANDLE srv = srvBase;
+			srv.ptr += static_cast<UINT64>(sm.materialSlot) * 2 * m_srvDescSize;
+			cmd->SetGraphicsRootDescriptorTable(3, srv);
+
+			cmd->DrawInstanced(sm.vertexCount, 1, sm.vertexOffset, 0);
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// ПРОХОД 2: Light Stage → аккумулируем освещение в back buffer
+	// ═══════════════════════════════════════════════════════════════════════
+	m_gbuffer.TransitionToRead(cmd);
+
+	// DSV не привязываем: depth сейчас читается как SRV (t3)
+	cmd->OMSetRenderTargets(1, &backBufferRtv, FALSE, nullptr);
+	cmd->ClearRenderTargetView(backBufferRtv, DirectX::Colors::Black, 0, nullptr);
+
+	cmd->SetGraphicsRootSignature(m_lightRootSig.Get());
+
+	ID3D12DescriptorHeap* gbufHeaps[] = { m_gbuffer.SrvHeap() };
+	cmd->SetDescriptorHeaps(1, gbufHeaps);
+
+	cmd->SetGraphicsRootConstantBufferView(0, m_lightPassCB->Resource()->GetGPUVirtualAddress());
+	cmd->SetGraphicsRootDescriptorTable(2, m_gbuffer.SrvGpuStart());
+
+	cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	cmd->IASetVertexBuffers(0, 1, nullptr);   // отвязываем VB прошлого прохода
+	cmd->IASetIndexBuffer(nullptr);
+
+	const D3D12_GPU_VIRTUAL_ADDRESS lightCbBase = m_lightCB->Resource()->GetGPUVirtualAddress();
+
+	if (m_debugMode != 0)
+	{
+		// Отладочный режим: один fullscreen-треугольник, показываем таргет
+		cmd->SetPipelineState(m_debugPSO.Get());
+		cmd->SetGraphicsRootConstantBufferView(1, lightCbBase);
+		cmd->DrawInstanced(3, 1, 0, 0);
+	}
+	else
+	{
+		cmd->SetPipelineState(m_lightPSO.Get());
+
+		for (size_t i = 0; i < m_lights.size(); ++i)
+		{
+			cmd->SetGraphicsRootConstantBufferView(
+				1, lightCbBase + static_cast<UINT64>(i) * m_lightCBStride);
+
+			// Один треугольник на весь экран (лекция 03, слайд 23)
+			cmd->DrawInstanced(3, 1, 0, 0);
+		}
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Управление
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::ToggleUvAnimation()
+{
+	m_uvAnimEnabled = !m_uvAnimEnabled;
+	OutputDebugStringA(m_uvAnimEnabled ? "[UV] Animation ON\n" : "[UV] Animation OFF\n");
+}
+
+void RenderingSystem::ScaleTiling(float factor)
+{
+	m_uvTile.x *= factor;
+	m_uvTile.y *= factor;
+}
+
+void RenderingSystem::ResetUv()
+{
+	m_uvTile   = { 1.0f, 1.0f };
+	m_uvOffset = { 0.0f, 0.0f };
+	OutputDebugStringA("[UV] Reset tile=1 offset=0\n");
+}
+
+void RenderingSystem::SetDebugMode(uint32_t mode)
+{
+	m_debugMode = (m_debugMode == mode) ? 0u : mode;   // повторное нажатие выключает
+}
+
+void RenderingSystem::ScaleLightIntensity(float factor)
+{
+	m_lightIntensityScale *= factor;
+	m_lightIntensityScale = std::max(0.05f, std::min(m_lightIntensityScale, 20.0f));
+}
