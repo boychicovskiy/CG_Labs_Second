@@ -346,6 +346,19 @@ void Framework::HandleKeyboardShortcuts()
 
 	if (JustPressed(VK_OEM_PLUS))  m_renderer->ScaleLightIntensity(1.25f);
 	if (JustPressed(VK_OEM_MINUS)) m_renderer->ScaleLightIntensity(0.8f);
+
+	// ── ДЗ №3: тесселяция и карты нормалей ──────────────────────────────────
+	if (JustPressed('G')) m_renderer->ToggleTessellation();
+	if (JustPressed('F')) m_renderer->ToggleWireframe();
+	if (JustPressed('N')) m_renderer->ToggleNormalMapping();
+	if (JustPressed('B')) m_renderer->ToggleGreenChannelFlip();
+	if (JustPressed('C')) m_renderer->ToggleHullBackfaceCulling();
+
+	if (JustPressed(VK_OEM_COMMA))  m_renderer->ScaleDisplacement(0.75f);   // ,
+	if (JustPressed(VK_OEM_PERIOD)) m_renderer->ScaleDisplacement(1.33f);   // .
+
+	if (JustPressed(VK_PRIOR)) m_renderer->ScaleMaxTessFactor(+1.0f);       // PageUp
+	if (JustPressed(VK_NEXT))  m_renderer->ScaleMaxTessFactor(-1.0f);       // PageDown
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

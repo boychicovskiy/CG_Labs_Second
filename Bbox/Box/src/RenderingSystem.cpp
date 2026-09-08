@@ -23,6 +23,9 @@ namespace {
 	const std::wstring kObjPathW  = L"assets\\sponza.obj";
 	const std::wstring kAssetDirW = L"assets\\";
 
+	// diffuse, alpha, normal, displacement — по четыре SRV на материал
+	const UINT kTexturesPerMaterial = 4;
+
 	std::string WideToUtf8(const std::wstring& w)
 	{
 		if (w.empty()) return {};
@@ -63,6 +66,7 @@ void RenderingSystem::Init(ID3D12Device* device,
 	BuildGeometryRootSignature(device);
 	BuildLightRootSignature(device);
 	BuildGeometryPSO(device);
+	BuildTessellationPSO(device);
 	BuildLightPSO(device);
 
 	m_gbuffer.Init(device);
@@ -115,6 +119,12 @@ void RenderingSystem::BuildShaders()
 	m_geoVS = CompileShader(geoFile, nullptr, "VS", "vs_5_1");
 	m_geoPS = CompileShader(geoFile, nullptr, "PS", "ps_5_1");
 
+	// Конвейер с тесселяцией: тот же файл, другие точки входа.
+	// Пиксельный шейдер общий — G-Buffer у обоих путей одинаковый.
+	m_geoVSTess = CompileShader(geoFile, nullptr, "VS_Tess", "vs_5_1");
+	m_geoHS     = CompileShader(geoFile, nullptr, "HS",      "hs_5_1");
+	m_geoDS     = CompileShader(geoFile, nullptr, "DS",      "ds_5_1");
+
 	m_lightVS = CompileShader(lightFile, nullptr, "VS", "vs_5_1");
 	m_lightPS = CompileShader(lightFile, nullptr, "PS", "ps_5_1");
 	m_debugPS = CompileShader(lightFile, nullptr, "PS_Debug", "ps_5_1");
@@ -130,22 +140,26 @@ void RenderingSystem::BuildShaders()
 // ═════════════════════════════════════════════════════════════════════════════
 void RenderingSystem::BuildGeometryRootSignature(ID3D12Device* device)
 {
+	// t0 = diffuse, t1 = alpha, t2 = normal, t3 = displacement.
+	// t3 читает domain shader, t0..t2 — пиксельный, поэтому видимость ALL.
 	D3D12_DESCRIPTOR_RANGE srvRange = {};
 	srvRange.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	srvRange.NumDescriptors                    = 2;   // t0 = diffuse, t1 = alpha
+	srvRange.NumDescriptors                    = kTexturesPerMaterial;
 	srvRange.BaseShaderRegister                = 0;
 	srvRange.RegisterSpace                     = 0;
 	srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
+	// Все константные буферы видимы всем стадиям: hull shader читает параметры
+	// тесселяции из b1, domain shader — ViewProj из b1 и силу смещения из b2.
 	D3D12_ROOT_PARAMETER params[4] = {};
 
 	params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	params[0].Descriptor.ShaderRegister = 0;
-	params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+	params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
 	params[1].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	params[1].Descriptor.ShaderRegister = 1;
-	params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+	params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
 	params[2].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	params[2].Descriptor.ShaderRegister = 2;
@@ -154,7 +168,7 @@ void RenderingSystem::BuildGeometryRootSignature(ID3D12Device* device)
 	params[3].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[3].DescriptorTable.NumDescriptorRanges = 1;
 	params[3].DescriptorTable.pDescriptorRanges   = &srvRange;
-	params[3].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+	params[3].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
 
 	D3D12_STATIC_SAMPLER_DESC sampler = {};
 	sampler.Filter           = D3D12_FILTER_ANISOTROPIC;
@@ -169,7 +183,7 @@ void RenderingSystem::BuildGeometryRootSignature(ID3D12Device* device)
 	sampler.MaxLOD           = D3D12_FLOAT32_MAX;
 	sampler.ShaderRegister   = 0;
 	sampler.RegisterSpace    = 0;
-	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   // DS тоже сэмплирует
 
 	D3D12_ROOT_SIGNATURE_DESC desc = {};
 	desc.NumParameters     = _countof(params);
@@ -246,7 +260,7 @@ void RenderingSystem::BuildGeometryPSO(ID3D12Device* device)
 	{
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 		{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-		{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TANGENT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 	};
 
@@ -309,6 +323,92 @@ void RenderingSystem::BuildGeometryPSO(ID3D12Device* device)
 	pso.SampleDesc.Count      = 1;
 
 	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_geoPSO)));
+
+	// Каркасный вариант — нужен, чтобы видеть плотность сетки (слайд 67)
+	pso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_geoPSOWire)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PSO с тесселяцией (лекция 04, слайды 24–31)
+//
+// Отличий от обычного PSO ровно три:
+//   1. заполнены поля HS и DS
+//   2. VS другой — выдаёт мировые координаты, а не clip space
+//   3. PrimitiveTopologyType = PATCH, а не TRIANGLE
+// Пиксельный шейдер, форматы render target'ов и depth-состояние те же.
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildTessellationPSO(ID3D12Device* device)
+{
+	D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+	{
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TANGENT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+	};
+
+	D3D12_RASTERIZER_DESC raster = {};
+	raster.FillMode              = D3D12_FILL_MODE_SOLID;
+	raster.CullMode              = D3D12_CULL_MODE_NONE;
+	raster.FrontCounterClockwise = FALSE;
+	raster.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+	raster.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+	raster.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+	raster.DepthClipEnable       = TRUE;
+	raster.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+	D3D12_BLEND_DESC blend = {};
+	for (UINT i = 0; i < GBuffer::RT_Count; ++i)
+	{
+		blend.RenderTarget[i].BlendEnable           = FALSE;
+		blend.RenderTarget[i].SrcBlend              = D3D12_BLEND_ONE;
+		blend.RenderTarget[i].DestBlend             = D3D12_BLEND_ZERO;
+		blend.RenderTarget[i].BlendOp               = D3D12_BLEND_OP_ADD;
+		blend.RenderTarget[i].SrcBlendAlpha         = D3D12_BLEND_ONE;
+		blend.RenderTarget[i].DestBlendAlpha        = D3D12_BLEND_ZERO;
+		blend.RenderTarget[i].BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+		blend.RenderTarget[i].LogicOp               = D3D12_LOGIC_OP_NOOP;
+		blend.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	}
+
+	D3D12_DEPTH_STENCIL_DESC ds = {};
+	ds.DepthEnable      = TRUE;
+	ds.DepthWriteMask   = D3D12_DEPTH_WRITE_MASK_ALL;
+	ds.DepthFunc        = D3D12_COMPARISON_FUNC_LESS;
+	ds.StencilEnable    = FALSE;
+	ds.StencilReadMask  = D3D12_DEFAULT_STENCIL_READ_MASK;
+	ds.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+	ds.FrontFace.StencilFailOp      = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilPassOp      = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilFunc        = D3D12_COMPARISON_FUNC_ALWAYS;
+	ds.BackFace = ds.FrontFace;
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+	pso.InputLayout           = { inputLayout, _countof(inputLayout) };
+	pso.pRootSignature        = m_geoRootSig.Get();
+	pso.VS                    = { m_geoVSTess->GetBufferPointer(), m_geoVSTess->GetBufferSize() };
+	pso.HS                    = { m_geoHS->GetBufferPointer(),     m_geoHS->GetBufferSize() };
+	pso.DS                    = { m_geoDS->GetBufferPointer(),     m_geoDS->GetBufferSize() };
+	pso.PS                    = { m_geoPS->GetBufferPointer(),     m_geoPS->GetBufferSize() };
+	pso.RasterizerState       = raster;
+	pso.BlendState            = blend;
+	pso.DepthStencilState     = ds;
+	pso.SampleMask            = D3D12_DEFAULT_SAMPLE_MASK;
+	// PATCH, а не TRIANGLE: на вход тесселятора приходят патчи из 3 контрольных
+	// точек, поэтому и топология в IASetPrimitiveTopology будет PATCHLIST.
+	pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+	pso.NumRenderTargets      = GBuffer::RT_Count;
+	for (UINT i = 0; i < GBuffer::RT_Count; ++i)
+		pso.RTVFormats[i] = GBuffer::Format(i);
+	pso.DSVFormat             = m_depthStencilFormat;
+	pso.SampleDesc.Count      = 1;
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_tessPSO)));
+
+	pso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_tessPSOWire)));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -570,6 +670,34 @@ void RenderingSystem::LoadScene(ID3D12Device* device, ID3D12GraphicsCommandList*
 			mat.constants.AlphaTest = mat.alphaTex ? 1u : 0u;
 		}
 
+		// ── ДЗ №3: карта смещения и карта нормалей ──────────────────────────
+		// В этой сборке Sponza файлы *_bump.dds — полутоновые карты высот
+		// (R == G == B), а не карты нормалей. Значит их можно использовать
+		// как displacement напрямую, а карту нормалей взять из парного файла
+		// *_nrm.dds, сгенерированного из той же карты высот. Слайд 38 лекции
+		// именно это и советует: карта нормалей должна быть согласована
+		// с картой смещения.
+		if (!m.bump_texname.empty())
+		{
+			const std::string bumpName = m.bump_texname;
+
+			mat.dispTex = LoadTextureCached(device, cmd,
+				Utf8ToWide(baseDir + bumpName), uploadKeepAlive);
+			mat.constants.HasDisplacement = mat.dispTex ? 1u : 0u;
+
+			// textures\foo_bump.dds → textures\foo_nrm.dds
+			const std::string suffix = "_bump.dds";
+			if (bumpName.size() > suffix.size() &&
+			    bumpName.compare(bumpName.size() - suffix.size(), suffix.size(), suffix) == 0)
+			{
+				std::string nrmName = bumpName.substr(0, bumpName.size() - suffix.size()) + "_nrm.dds";
+
+				mat.normalTex = LoadTextureCached(device, cmd,
+					Utf8ToWide(baseDir + nrmName), uploadKeepAlive);
+				mat.constants.HasNormalMap = mat.normalTex ? 1u : 0u;
+			}
+		}
+
 		m_materials.push_back(std::move(mat));
 	}
 
@@ -632,10 +760,64 @@ void RenderingSystem::LoadScene(ID3D12Device* device, ID3D12GraphicsCommandList*
 				XMStoreFloat3(&n0, fn); n1 = n0; n2 = n0;
 			}
 
+			XMFLOAT2 uv0 = ReadUV(i0.texcoord_index);
+			XMFLOAT2 uv1 = ReadUV(i1.texcoord_index);
+			XMFLOAT2 uv2 = ReadUV(i2.texcoord_index);
+
+			// ── Касательная по треугольнику (лекция 04, слайд 9) ────────────
+			// В OBJ тангентов нет, считаем их сами из рёбер и разностей UV.
+			// Буфер невершинно-индексированный (triangle soup), поэтому одна
+			// касательная присваивается всем трём вершинам грани. Плоское
+			// касательное пространство не страшно: в пиксельном шейдере оно
+			// ортогонализуется по Граму-Шмидту относительно гладкой нормали.
+			XMFLOAT4 tangent = { 1.0f, 0.0f, 0.0f, 1.0f };
+			{
+				XMFLOAT3 e1 = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
+				XMFLOAT3 e2 = { p2.x - p0.x, p2.y - p0.y, p2.z - p0.z };
+
+				float du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
+				float du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
+
+				float det = du1 * dv2 - du2 * dv1;
+
+				if (fabsf(det) > 1e-12f)
+				{
+					float f = 1.0f / det;
+
+					XMFLOAT3 T = {
+						f * (dv2 * e1.x - dv1 * e2.x),
+						f * (dv2 * e1.y - dv1 * e2.y),
+						f * (dv2 * e1.z - dv1 * e2.z)
+					};
+					XMFLOAT3 B = {
+						f * (-du2 * e1.x + du1 * e2.x),
+						f * (-du2 * e1.y + du1 * e2.y),
+						f * (-du2 * e1.z + du1 * e2.z)
+					};
+
+					XMVECTOR Tv = XMLoadFloat3(&T);
+					XMVECTOR Bv = XMLoadFloat3(&B);
+					XMVECTOR Nv = XMLoadFloat3(&n0);
+
+					if (XMVectorGetX(XMVector3LengthSq(Tv)) > 1e-20f)
+					{
+						Tv = XMVector3Normalize(Tv);
+
+						// Хиральность: если N×T смотрит против B, базис зеркальный
+						float handedness =
+							(XMVectorGetX(XMVector3Dot(XMVector3Cross(Nv, Tv), Bv)) < 0.0f) ? -1.0f : 1.0f;
+
+						XMFLOAT3 Tn;
+						XMStoreFloat3(&Tn, Tv);
+						tangent = { Tn.x, Tn.y, Tn.z, handedness };
+					}
+				}
+			}
+
 			auto& g = groups[matId];
-			g.push_back(Vertex{ p0, n0, XMFLOAT4(1,1,1,1), ReadUV(i0.texcoord_index) });
-			g.push_back(Vertex{ p1, n1, XMFLOAT4(1,1,1,1), ReadUV(i1.texcoord_index) });
-			g.push_back(Vertex{ p2, n2, XMFLOAT4(1,1,1,1), ReadUV(i2.texcoord_index) });
+			g.push_back(Vertex{ p0, n0, tangent, uv0 });
+			g.push_back(Vertex{ p1, n1, tangent, uv1 });
+			g.push_back(Vertex{ p2, n2, tangent, uv2 });
 
 			ExpandBounds(p0); ExpandBounds(p1); ExpandBounds(p2);
 			indexOffset += 3;
@@ -655,6 +837,14 @@ void RenderingSystem::LoadScene(ID3D12Device* device, ID3D12GraphicsCommandList*
 		// material_id из tinyobj → слот в m_materials (0 занят дефолтным)
 		sm.materialSlot = (kv.first >= 0 && kv.first < static_cast<int>(materials.size()))
 			? static_cast<UINT>(kv.first + 1) : 0u;
+
+		// Тесселируем только каменную геометрию: материал с картой высот
+		// и без альфа-маски. Листва и цепи (leaf, chain) имеют map_bump,
+		// но это плоские билборды с вырезанной альфой — смещать их бессмысленно.
+		{
+			const MaterialConstants& mc = m_materials[sm.materialSlot].constants;
+			sm.tessellated = (mc.HasDisplacement != 0) && (mc.AlphaTest == 0);
+		}
 
 		m_subMeshes.push_back(sm);
 		vertices.insert(vertices.end(), kv.second.begin(), kv.second.end());
@@ -717,7 +907,7 @@ void RenderingSystem::BuildMaterialSrvHeap(ID3D12Device* device)
 	if (slots == 0) return;
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-	heapDesc.NumDescriptors = slots * 2;
+	heapDesc.NumDescriptors = slots * kTexturesPerMaterial;
 	heapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	heapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	ThrowIfFailed(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_matSrvHeap)));
@@ -741,13 +931,13 @@ void RenderingSystem::BuildMaterialSrvHeap(ID3D12Device* device)
 		device->CreateShaderResourceView(target, &srv, h);
 	};
 
+	// Порядок внутри четвёрки совпадает с регистрами t0..t3 в шейдере
 	for (const auto& mat : m_materials)
 	{
-		MakeSrv(mat.diffuseTex.Get(), handle);
-		handle.ptr += m_srvDescSize;
-
-		MakeSrv(mat.alphaTex.Get(), handle);
-		handle.ptr += m_srvDescSize;
+		MakeSrv(mat.diffuseTex.Get(), handle);  handle.ptr += m_srvDescSize;  // t0
+		MakeSrv(mat.alphaTex.Get(),   handle);  handle.ptr += m_srvDescSize;  // t1
+		MakeSrv(mat.normalTex.Get(),  handle);  handle.ptr += m_srvDescSize;  // t2
+		MakeSrv(mat.dispTex.Get(),    handle);  handle.ptr += m_srvDescSize;  // t3
 	}
 }
 
@@ -894,6 +1084,19 @@ void RenderingSystem::Update(double dt,
 
 	GeoPassConstants geoPass;
 	XMStoreFloat4x4(&geoPass.ViewProj, XMMatrixTranspose(viewProj));
+
+	// Параметры тесселяции: hull shader считает по ним коэффициенты рёбер,
+	// domain shader — величину смещения.
+	geoPass.EyePosW           = eyePos;
+	geoPass.TessFactorMax     = m_tessFactorMax;
+	geoPass.TessFactorMin     = 1.0f;
+	geoPass.TessDistNear      = m_tessDistNear;
+	geoPass.TessDistFar       = m_tessDistFar;
+	geoPass.DisplacementScale = m_displacementScale;
+	geoPass.NormalMapEnabled  = m_normalMapEnabled ? 1u : 0u;
+	geoPass.FlipGreenChannel  = m_flipGreenChannel ? 1u : 0u;
+	geoPass.BackfaceCullHS    = m_backfaceCullHS   ? 1u : 0u;
+
 	m_geoPassCB->CopyData(0, geoPass);
 
 	// ── MaterialCB: тайлинг/смещение общие, остальное — из .mtl ─────────────
@@ -947,7 +1150,6 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 
 	if (SceneLoaded())
 	{
-		cmd->SetPipelineState(m_geoPSO.Get());
 		cmd->SetGraphicsRootSignature(m_geoRootSig.Get());
 
 		ID3D12DescriptorHeap* matHeaps[] = { m_matSrvHeap.Get() };
@@ -956,23 +1158,47 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 		cmd->SetGraphicsRootConstantBufferView(0, m_objectCB->Resource()->GetGPUVirtualAddress());
 		cmd->SetGraphicsRootConstantBufferView(1, m_geoPassCB->Resource()->GetGPUVirtualAddress());
 
-		cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		cmd->IASetVertexBuffers(0, 1, &m_modelVBV);
 
-		const D3D12_GPU_VIRTUAL_ADDRESS matCbBase = m_materialCB->Resource()->GetGPUVirtualAddress();
-		const D3D12_GPU_DESCRIPTOR_HANDLE srvBase = m_matSrvHeap->GetGPUDescriptorHandleForHeapStart();
+		const D3D12_GPU_VIRTUAL_ADDRESS   matCbBase = m_materialCB->Resource()->GetGPUVirtualAddress();
+		const D3D12_GPU_DESCRIPTOR_HANDLE srvBase   = m_matSrvHeap->GetGPUDescriptorHandleForHeapStart();
 
-		for (const auto& sm : m_subMeshes)
+		// Один и тот же вершинный буфер рисуется двумя конвейерами, поэтому
+		// подмеши идут двумя группами: смена топологии и PSO делается один раз
+		// на группу, а не на каждый подмеш.
+		auto DrawGroup = [&](bool tessellated)
 		{
-			cmd->SetGraphicsRootConstantBufferView(
-				2, matCbBase + static_cast<UINT64>(sm.materialSlot) * m_materialCBStride);
+			if (tessellated)
+			{
+				cmd->SetPipelineState(m_wireframe ? m_tessPSOWire.Get() : m_tessPSO.Get());
+				// 3 контрольные точки на патч — соответствует [domain("tri")]
+				cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+			}
+			else
+			{
+				cmd->SetPipelineState(m_wireframe ? m_geoPSOWire.Get() : m_geoPSO.Get());
+				cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			}
 
-			D3D12_GPU_DESCRIPTOR_HANDLE srv = srvBase;
-			srv.ptr += static_cast<UINT64>(sm.materialSlot) * 2 * m_srvDescSize;
-			cmd->SetGraphicsRootDescriptorTable(3, srv);
+			for (const auto& sm : m_subMeshes)
+			{
+				const bool useTess = sm.tessellated && m_tessEnabled;
+				if (useTess != tessellated)
+					continue;
 
-			cmd->DrawInstanced(sm.vertexCount, 1, sm.vertexOffset, 0);
-		}
+				cmd->SetGraphicsRootConstantBufferView(
+					2, matCbBase + static_cast<UINT64>(sm.materialSlot) * m_materialCBStride);
+
+				D3D12_GPU_DESCRIPTOR_HANDLE srv = srvBase;
+				srv.ptr += static_cast<UINT64>(sm.materialSlot) * kTexturesPerMaterial * m_srvDescSize;
+				cmd->SetGraphicsRootDescriptorTable(3, srv);
+
+				cmd->DrawInstanced(sm.vertexCount, 1, sm.vertexOffset, 0);
+			}
+		};
+
+		DrawGroup(false);
+		DrawGroup(true);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -1051,4 +1277,59 @@ void RenderingSystem::ScaleLightIntensity(float factor)
 {
 	m_lightIntensityScale *= factor;
 	m_lightIntensityScale = std::max(0.05f, std::min(m_lightIntensityScale, 20.0f));
+}
+
+// ── ДЗ №3 ────────────────────────────────────────────────────────────────────
+void RenderingSystem::ToggleTessellation()
+{
+	m_tessEnabled = !m_tessEnabled;
+	OutputDebugStringA(m_tessEnabled ? "[TESS] ON\n" : "[TESS] OFF\n");
+}
+
+void RenderingSystem::ToggleWireframe()
+{
+	m_wireframe = !m_wireframe;
+	OutputDebugStringA(m_wireframe ? "[TESS] Wireframe ON\n" : "[TESS] Wireframe OFF\n");
+}
+
+void RenderingSystem::ToggleNormalMapping()
+{
+	m_normalMapEnabled = !m_normalMapEnabled;
+	OutputDebugStringA(m_normalMapEnabled ? "[NRM] Normal mapping ON\n" : "[NRM] Normal mapping OFF\n");
+}
+
+void RenderingSystem::ToggleGreenChannelFlip()
+{
+	m_flipGreenChannel = !m_flipGreenChannel;
+	OutputDebugStringA(m_flipGreenChannel ? "[NRM] Green channel FLIPPED\n" : "[NRM] Green channel normal\n");
+}
+
+void RenderingSystem::ToggleHullBackfaceCulling()
+{
+	m_backfaceCullHS = !m_backfaceCullHS;
+	OutputDebugStringA(m_backfaceCullHS ? "[TESS] HS backface culling ON\n" : "[TESS] HS backface culling OFF\n");
+}
+
+void RenderingSystem::ScaleDisplacement(float factor)
+{
+	m_displacementScale *= factor;
+	m_displacementScale = std::max(0.0f, std::min(m_displacementScale, 0.5f));
+
+#if defined(_DEBUG)
+	char buf[64];
+	sprintf_s(buf, "[TESS] Displacement scale = %.4f\n", m_displacementScale);
+	OutputDebugStringA(buf);
+#endif
+}
+
+void RenderingSystem::ScaleMaxTessFactor(float delta)
+{
+	// Верхняя граница совпадает с [maxtessfactor(8.0)] в hull shader'е
+	m_tessFactorMax = std::max(1.0f, std::min(m_tessFactorMax + delta, 8.0f));
+
+#if defined(_DEBUG)
+	char buf[64];
+	sprintf_s(buf, "[TESS] Max tess factor = %.1f\n", m_tessFactorMax);
+	OutputDebugStringA(buf);
+#endif
 }

@@ -13,12 +13,13 @@ namespace dx {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Вершина. Layout не менялся с ДЗ №1: stride = 48 байт.
+// Вершина. Stride остался 48 байт: неиспользуемый Color (ДЗ №1) заменён на
+// касательную для normal mapping (ДЗ №3). w хранит хиральность базиса TBN.
 // ─────────────────────────────────────────────────────────────────────────────
 struct Vertex {
 	DirectX::XMFLOAT3 Pos;                        // offset  0
 	DirectX::XMFLOAT3 Normal;                     // offset 12
-	DirectX::XMFLOAT4 Color;                      // offset 24
+	DirectX::XMFLOAT4 TangentU;                   // offset 24  (xyz = T, w = ±1)
 	DirectX::XMFLOAT2 TexCoord = { 0.0f, 0.0f };  // offset 40
 };
 
@@ -32,9 +33,23 @@ struct alignas(16) ObjectConstants {
 	DirectX::XMFLOAT4X4 WorldInvTranspose = dx::Identity4x4();
 };
 
-// b1: одна на кадр
+// b1: одна на кадр. Кроме матрицы содержит параметры тесселяции (ДЗ №3):
+// hull shader считает по ним коэффициенты, domain shader — величину смещения.
 struct alignas(16) GeoPassConstants {
 	DirectX::XMFLOAT4X4 ViewProj = dx::Identity4x4();
+
+	DirectX::XMFLOAT3 EyePosW        = { 0.0f, 0.0f, 0.0f };
+	float             TessFactorMax  = 8.0f;     // вблизи
+
+	float             TessFactorMin  = 1.0f;     // вдали
+	float             TessDistNear   = 0.25f;    // ближе — максимальный фактор
+	float             TessDistFar    = 3.00f;    // дальше — минимальный
+	float             DisplacementScale = 0.008f;
+
+	uint32_t          NormalMapEnabled = 1;
+	uint32_t          FlipGreenChannel = 0;      // на случай другого соглашения карты
+	uint32_t          BackfaceCullHS   = 0;      // отбраковка патчей в hull shader
+	uint32_t          _pad0            = 0;
 };
 
 // b2: одна на подмеш (материал). Ровно 64 байта.
@@ -47,8 +62,10 @@ struct alignas(16) MaterialConstants {
 	DirectX::XMFLOAT2 UvScale       = { 1.0f, 1.0f };               // тайлинг (ДЗ №1)
 	DirectX::XMFLOAT2 UvOffset      = { 0.0f, 0.0f };               // UV-анимация (ДЗ №1)
 
-	uint32_t          AlphaTest     = 0;                            // есть ли map_d
-	float             _pad0 = 0.0f, _pad1 = 0.0f, _pad2 = 0.0f;
+	uint32_t          AlphaTest       = 0;    // есть ли map_d
+	uint32_t          HasNormalMap    = 0;    // есть ли *_nrm.dds
+	uint32_t          HasDisplacement = 0;    // есть ли map_bump (карта высот)
+	float             DispScale       = 1.0f; // множитель к глобальной силе смещения
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,8 +109,9 @@ struct alignas(16) LightPassConstants {
 	DirectX::XMFLOAT4 AmbientColor = { 0.12f, 0.12f, 0.14f, 1.0f };
 };
 
+static_assert(sizeof(Vertex)              == 48,     "Vertex stride must stay 48 bytes.");
 static_assert(sizeof(ObjectConstants)     % 16 == 0, "ObjectConstants must be 16-byte aligned.");
-static_assert(sizeof(GeoPassConstants)    % 16 == 0, "GeoPassConstants must be 16-byte aligned.");
+static_assert(sizeof(GeoPassConstants)    == 112,    "GeoPassConstants must match HLSL layout.");
 static_assert(sizeof(MaterialConstants)   == 64,     "MaterialConstants must match HLSL layout.");
 static_assert(sizeof(LightConstants)      == 64,     "LightConstants must match HLSL layout.");
 static_assert(sizeof(LightPassConstants)  % 16 == 0, "LightPassConstants must be 16-byte aligned.");

@@ -15,14 +15,18 @@
 struct SubMesh {
 	UINT vertexOffset = 0;
 	UINT vertexCount  = 0;
-	UINT materialSlot = 0;   // индекс в m_materials / в SRV-куче материалов
+	UINT materialSlot = 0;      // индекс в m_materials / в SRV-куче материалов
+	bool tessellated  = false;  // рисовать ли через HS/DS с displacement
 };
 
-// Материал: константы + пара текстур (diffuse, alpha-mask)
+// Материал: константы + до четырёх текстур.
+// SRV-куча хранит их четвёрками, порядок совпадает с регистрами t0..t3.
 struct Material {
 	MaterialConstants        constants;
-	ComPtr<ID3D12Resource>   diffuseTex;   // nullptr → белая заглушка
-	ComPtr<ID3D12Resource>   alphaTex;     // nullptr → белая заглушка
+	ComPtr<ID3D12Resource>   diffuseTex;   // t0, nullptr → белая заглушка
+	ComPtr<ID3D12Resource>   alphaTex;     // t1, map_d
+	ComPtr<ID3D12Resource>   normalTex;    // t2, *_nrm.dds (сгенерирована из карты высот)
+	ComPtr<ID3D12Resource>   dispTex;      // t3, map_bump (карта высот)
 	std::string              name;
 };
 
@@ -83,6 +87,15 @@ public:
 	uint32_t DebugMode() const { return m_debugMode; }
 	void ScaleLightIntensity(float factor);
 
+	// ── ДЗ №3 ───────────────────────────────────────────────────────────────
+	void ToggleTessellation();
+	void ToggleWireframe();
+	void ToggleNormalMapping();
+	void ToggleGreenChannelFlip();
+	void ToggleHullBackfaceCulling();
+	void ScaleDisplacement(float factor);
+	void ScaleMaxTessFactor(float delta);
+
 	bool SceneLoaded() const { return !m_subMeshes.empty(); }
 	size_t LightCount() const { return m_lights.size(); }
 
@@ -92,6 +105,7 @@ private:
 	void BuildGeometryRootSignature(ID3D12Device* device);
 	void BuildLightRootSignature(ID3D12Device* device);
 	void BuildGeometryPSO(ID3D12Device* device);
+	void BuildTessellationPSO(ID3D12Device* device);
 	void BuildLightPSO(ID3D12Device* device);
 	void BuildConstantBuffers(ID3D12Device* device);
 
@@ -118,13 +132,17 @@ private:
 
 	// ── Шейдеры ─────────────────────────────────────────────────────────────
 	ComPtr<ID3DBlob> m_geoVS, m_geoPS;
+	ComPtr<ID3DBlob> m_geoVSTess, m_geoHS, m_geoDS;
 	ComPtr<ID3DBlob> m_lightVS, m_lightPS, m_debugPS;
 
 	// ── Root signatures / PSO ───────────────────────────────────────────────
 	ComPtr<ID3D12RootSignature> m_geoRootSig;
 	ComPtr<ID3D12RootSignature> m_lightRootSig;
 
-	ComPtr<ID3D12PipelineState> m_geoPSO;
+	ComPtr<ID3D12PipelineState> m_geoPSO;        // без тесселяции, solid
+	ComPtr<ID3D12PipelineState> m_geoPSOWire;    // без тесселяции, wireframe
+	ComPtr<ID3D12PipelineState> m_tessPSO;       // VS→HS→DS→PS, solid
+	ComPtr<ID3D12PipelineState> m_tessPSOWire;   // VS→HS→DS→PS, wireframe
 	ComPtr<ID3D12PipelineState> m_lightPSO;
 	ComPtr<ID3D12PipelineState> m_debugPSO;
 
@@ -172,6 +190,18 @@ private:
 	bool              m_uvAnimEnabled = false;
 
 	uint32_t m_debugMode = 0;
+
+	// ── Тесселяция и normal mapping (ДЗ №3) ─────────────────────────────────
+	bool  m_tessEnabled       = true;
+	bool  m_wireframe         = false;
+	bool  m_normalMapEnabled  = true;
+	bool  m_flipGreenChannel  = false;
+	bool  m_backfaceCullHS    = false;
+
+	float m_displacementScale = 0.008f;
+	float m_tessFactorMax     = 8.0f;
+	float m_tessDistNear      = 0.25f;
+	float m_tessDistFar       = 3.00f;
 
 	// Синхронизация для одноразовых загрузок
 	ComPtr<ID3D12Fence> m_uploadFence;
