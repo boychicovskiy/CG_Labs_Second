@@ -49,15 +49,20 @@ struct alignas(16) GeoPassConstants {
 	uint32_t          NormalMapEnabled = 1;
 	uint32_t          FlipGreenChannel = 0;      // на случай другого соглашения карты
 	uint32_t          BackfaceCullHS   = 0;      // отбраковка патчей в hull shader
-	uint32_t          _pad0            = 0;
+	float             RoughnessScale   = 1.0f;   // глобальная подстройка шероховатости
 };
 
 // b2: одна на подмеш (материал). Ровно 64 байта.
 struct alignas(16) MaterialConstants {
 	DirectX::XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };   // Kd из .mtl
 
-	DirectX::XMFLOAT3 SpecularColor = { 0.1f, 0.1f, 0.1f };         // Ks из .mtl
-	float             SpecPower     = 32.0f;                        // Ns из .mtl
+	// Metallic workflow (лекция 09, слайд 33). Phong-параметры Ks/Ns больше
+	// не нужны: шероховатость выводится из Ns при загрузке, а базовая
+	// отражательная способность диэлектриков фиксирована (0.04).
+	float Metallic  = 0.0f;
+	float Roughness = 0.5f;
+	float AmbientOcclusion = 1.0f;
+	float _matPad0 = 0.0f;
 
 	DirectX::XMFLOAT2 UvScale       = { 1.0f, 1.0f };               // тайлинг (ДЗ №1)
 	DirectX::XMFLOAT2 UvOffset      = { 0.0f, 0.0f };               // UV-анимация (ДЗ №1)
@@ -176,7 +181,7 @@ struct alignas(16) LightPassConstants {
 
 	DirectX::XMFLOAT2 InvScreenSize = { 0.0f, 0.0f };      // 1/width, 1/height
 	uint32_t          DebugMode     = 0;                   // 0=off, 1..4 = показать таргет G-Buffer
-	float             _pad1         = 0.0f;
+	uint32_t          IblEnabled    = 1;                   // лаба 8: аналитическое окружение
 
 	DirectX::XMFLOAT4 AmbientColor = { 0.12f, 0.12f, 0.14f, 1.0f };
 

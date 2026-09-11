@@ -10,6 +10,12 @@
 //
 // Writes into the same G-Buffer as the rest of the geometry pass, which means
 // the boxes are lit by the deferred light stage like everything else.
+//
+// Lab 8: the field doubles as a PBR material chart. Center.w and Extent.w were
+// free padding in the 48-byte instance record, so they now carry metallic and
+// roughness. The CPU fills them from the normalised box position, which turns
+// the field into the grid from slide 44 of lecture 09: metallic along one axis,
+// roughness along the other.
 //=============================================================================
 
 cbuffer InstancePassCB : register(b0)
@@ -24,23 +30,24 @@ struct VertexIn
     float3 NormalL : NORMAL;
 
     // slot 1 - per instance data
-    float4 Center  : INSTCENTER;
-    float4 Extent  : INSTEXTENT;
-    float4 Color   : INSTCOLOR;
+    float4 Center  : INSTCENTER;   // xyz = centre, w = metallic
+    float4 Extent  : INSTEXTENT;   // xyz = half extent, w = roughness
+    float4 Color   : INSTCOLOR;    // rgb = base color
 };
 
 struct VertexOut
 {
-    float4 PosH    : SV_POSITION;
-    float3 NormalW : NORMAL;
-    float4 Color   : COLOR;
+    float4 PosH      : SV_POSITION;
+    float3 NormalW   : NORMAL;
+    float4 Color     : COLOR;
+    float2 MatParams : MATPARAMS;   // x = metallic, y = roughness
 };
 
 struct GBufferOut
 {
     float4 Albedo   : SV_Target0;
     float4 Normal   : SV_Target1;
-    float4 Specular : SV_Target2;
+    float4 Material : SV_Target2;   // r = metallic, g = roughness, b = AO
 };
 
 VertexOut VS(VertexIn vin)
@@ -60,6 +67,11 @@ VertexOut VS(VertexIn vin)
 
     vout.Color = vin.Color;
 
+    // Roughness is clamped away from zero: a perfectly smooth GGX lobe is a
+    // delta function and produces fireflies on a single point light.
+    vout.MatParams = float2(saturate(vin.Center.w),
+                            clamp(vin.Extent.w, 0.05f, 1.0f));
+
     return vout;
 }
 
@@ -73,7 +85,7 @@ GBufferOut PS(VertexOut pin, bool isFront : SV_IsFrontFace)
 
     o.Albedo   = float4(pin.Color.rgb, 1.0f);
     o.Normal   = float4(N, 0.0f);
-    o.Specular = float4(0.25f, 0.25f, 0.25f, 48.0f / 255.0f);
+    o.Material = float4(pin.MatParams.x, pin.MatParams.y, 1.0f, 1.0f);
 
     return o;
 }

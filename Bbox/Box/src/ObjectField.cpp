@@ -123,9 +123,11 @@ void ObjectField::Init(ID3D12Device* device,
 
 		for (size_t i = 0; i < m_objectBounds.size(); ++i)
 		{
-			mapped[i].Center = m_objectBounds[i].Center();
-			mapped[i].Extent = m_objectBounds[i].Extent();
-			mapped[i].Color  = m_objectColors[i];
+			mapped[i].Center    = m_objectBounds[i].Center();
+			mapped[i].Extent    = m_objectBounds[i].Extent();
+			mapped[i].Color     = m_objectColors[i];
+			mapped[i].Metallic  = m_objectMaterial[i].x;
+			mapped[i].Roughness = m_objectMaterial[i].y;
 		}
 
 		m_allInstancesBuffer->Unmap(0, nullptr);
@@ -151,9 +153,11 @@ void ObjectField::Init(ID3D12Device* device,
 
 		for (size_t i = 0; i < boxes.size(); ++i)
 		{
-			mapped[i].Center = boxes[i].Center();
-			mapped[i].Extent = boxes[i].Extent();
-			mapped[i].Color  = { 0.2f, 1.0f, 0.4f, 1.0f };
+			mapped[i].Center    = boxes[i].Center();
+			mapped[i].Extent    = boxes[i].Extent();
+			mapped[i].Color     = { 0.2f, 1.0f, 0.4f, 1.0f };
+			mapped[i].Metallic  = 0.0f;
+			mapped[i].Roughness = 1.0f;
 		}
 
 		m_nodeBoxBuffer->Unmap(0, nullptr);
@@ -238,8 +242,10 @@ void ObjectField::BuildObjects(const AABB& region, uint32_t objectCount)
 
 	m_objectBounds.clear();
 	m_objectColors.clear();
+	m_objectMaterial.clear();
 	m_objectBounds.reserve(objectCount);
 	m_objectColors.reserve(objectCount);
+	m_objectMaterial.reserve(objectCount);
 
 	for (uint32_t i = 0; i < objectCount; ++i)
 	{
@@ -268,6 +274,23 @@ void ObjectField::BuildObjects(const AABB& region, uint32_t objectCount)
 		}
 
 		m_objectColors.push_back(col);
+
+		// ── Лаба 8: поле как таблица материалов ─────────────────────────
+		// Слайд 36 лекции 09 («PBR material») показывает набор материалов,
+		// заданных парой metallic/roughness. Здесь то же самое, только вместо
+		// сетки — облако коробок: параметры берутся из нормированной позиции,
+		// поэтому пролетая сквозь поле видно весь диапазон материалов.
+		const float tx = (ext.x > 1e-6f) ? ((c.x - region.Min.x) / ext.x * 0.5f) : 0.5f;
+		const float ty = (ext.y > 1e-6f) ? ((c.y - region.Min.y) / ext.y * 0.5f) : 0.5f;
+
+		XMFLOAT2 mr;
+		// Металл — не градиент, а признак «проводник или диэлектрик»
+		// (слайды 33-34): у диэлектриков F0 не выше 0.17, у металлов от 0.5,
+		// промежуточных материалов не бывает. Поэтому половина поля — металл.
+		mr.x = (tx > 0.5f) ? 1.0f : 0.0f;
+		mr.y = std::min(1.0f, std::max(0.05f, ty));
+
+		m_objectMaterial.push_back(mr);
 	}
 }
 
@@ -441,9 +464,11 @@ void ObjectField::Update(const XMMATRIX& renderViewProj, const XMMATRIX& cullVie
 		const uint32_t idx = m_visibleIndices[i];
 		const AABB& b = m_objectBounds[idx];
 
-		m_instanceMapped[i].Center = b.Center();
-		m_instanceMapped[i].Extent = b.Extent();
-		m_instanceMapped[i].Color  = m_objectColors[idx];
+		m_instanceMapped[i].Center    = b.Center();
+		m_instanceMapped[i].Extent    = b.Extent();
+		m_instanceMapped[i].Color     = m_objectColors[idx];
+		m_instanceMapped[i].Metallic  = m_objectMaterial[idx].x;
+		m_instanceMapped[i].Roughness = m_objectMaterial[idx].y;
 	}
 
 	const auto t1 = std::chrono::high_resolution_clock::now();

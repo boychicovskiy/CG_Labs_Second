@@ -241,7 +241,7 @@ void RenderingSystem::BuildGeometryRootSignature(ID3D12Device* device)
 // Root signature светового прохода
 //   b0 — LightPassCB (root CBV, ALL)
 //   b1 — LightCB     (root CBV, PS) — меняется на каждый источник
-//   t0..t3 — descriptor table: albedo, normal, specular, depth (PS)
+//   t0..t3 — descriptor table: albedo, normal, material, depth (PS)
 //   Сэмплер не нужен: читаем через Texture2D.Load (лекция 03, слайд 20)
 // ═════════════════════════════════════════════════════════════════════════════
 void RenderingSystem::BuildLightRootSignature(ID3D12Device* device)
@@ -815,10 +815,51 @@ void RenderingSystem::LoadScene(ID3D12Device* device, ID3D12GraphicsCommandList*
 		Material mat;
 		mat.name = m.name;
 
-		// Kd / Ks / Ns — то, чего не хватало в ДЗ №1
+		// ── Лаба 8: перевод .mtl в metallic workflow ────────────────────────
+		// В формате Wavefront параметров PBR нет вообще: есть Kd (альбедо),
+		// Ks (цвет блика) и Ns (экспонента Фонга). Лекция 09 (слайд 33)
+		// требует пару metallic/roughness, поэтому их надо вывести.
+		//
+		// Kd переходит в базовый цвет без изменений.
 		mat.constants.DiffuseAlbedo = { m.diffuse[0],  m.diffuse[1],  m.diffuse[2], 1.0f };
-		mat.constants.SpecularColor = { m.specular[0], m.specular[1], m.specular[2] };
-		mat.constants.SpecPower     = (m.shininess > 1.0f) ? m.shininess : 1.0f;
+
+		// Ns -> roughness. Обратная к «Phong-аппроксимации» Бринна:
+		// экспонента Ns соответствует alpha = sqrt(2 / (Ns + 2)),
+		// а alpha в GGX и есть roughness^2, поэтому
+		//     roughness = (2 / (Ns + 2))^(1/4).
+		// Нижняя граница 0.05 нужна, чтобы знаменатель NDF не взрывался:
+		// при roughness == 0 распределение микрофасетов вырождается в дельту
+		// (слайды 4-5 — чем глаже поверхность, тем уже пучок микрофасетов).
+		{
+			const float ns    = (m.shininess > 1.0f) ? m.shininess : 1.0f;
+			const float alpha = std::sqrt(2.0f / (ns + 2.0f));
+			float rough = std::sqrt(alpha);
+			rough = std::min(1.0f, std::max(0.05f, rough));
+
+			// Ks здесь не цвет отражения, а лишь признак: у металлов в Sponza
+			// он высокий и нейтральный. Настоящего канала metallic в .mtl нет,
+			// поэтому металлы опознаём по имени материала — их всего несколько.
+			const float ks = (m.specular[0] + m.specular[1] + m.specular[2]) / 3.0f;
+
+			auto nameHas = [&](const char* what) {
+				return m.name.find(what) != std::string::npos;
+			};
+
+			const bool isMetal = nameHas("chain") || nameHas("Chain") ||
+			                     nameHas("flagpole") || nameHas("Flagpole") ||
+			                     nameHas("metal") || nameHas("Metal");
+
+			mat.constants.Metallic  = isMetal ? 1.0f : 0.0f;
+			mat.constants.Roughness = isMetal ? std::min(rough, 0.35f) : rough;
+
+			// У диэлектриков с почти нулевым Ks блика в оригинале не было —
+			// делаем их заведомо шероховатыми, иначе штукатурка начнёт бликовать.
+			if (!isMetal && ks < 0.02f)
+				mat.constants.Roughness = std::max(mat.constants.Roughness, 0.85f);
+
+			// Карты AO в этой сборке Sponza нет, затенение считает световой проход.
+			mat.constants.AmbientOcclusion = 1.0f;
+		}
 
 		if (!m.diffuse_texname.empty())
 			mat.diffuseTex = LoadTextureCached(device, cmd,
@@ -1279,6 +1320,11 @@ void RenderingSystem::Update(double dt,
 	geoPass.FlipGreenChannel  = m_flipGreenChannel ? 1u : 0u;
 	geoPass.BackfaceCullHS    = m_backfaceCullHS   ? 1u : 0u;
 
+	// Лаба 8: глобальный множитель шероховатости — клавиши O / L.
+	// Позволяет прямо в кадре увидеть ряд «зеркало → матовое», о котором
+	// говорит слайд 41 лекции 09.
+	geoPass.RoughnessScale    = m_roughnessScale;
+
 	m_geoPassCB->CopyData(0, geoPass);
 
 	// ── MaterialCB: тайлинг/смещение общие, остальное — из .mtl ─────────────
@@ -1330,7 +1376,12 @@ void RenderingSystem::Update(double dt,
 	lp.EyePosW       = eyePos;
 	lp.InvScreenSize = { 1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height) };
 	lp.DebugMode     = m_debugMode;
-	lp.AmbientColor  = { 0.10f, 0.10f, 0.13f, 1.0f };
+	lp.IblEnabled    = m_iblEnabled ? 1u : 0u;
+
+	// Лаба 8: ambient больше не «плоская добавка» вида float3(0.03)*albedo
+	// (слайд 53), а цвет неба, от которого световой проход строит
+	// аналитическое окружение: облучённость + отражение (слайды 53-56, 80).
+	lp.AmbientColor  = { 0.32f, 0.42f, 0.62f, 1.0f };
 
 	XMStoreFloat4x4(&lp.View, XMMatrixTranspose(view));
 	for (UINT c = 0; c < ShadowMap::MaxCascades; ++c)
@@ -1654,6 +1705,26 @@ void RenderingSystem::ToggleHullBackfaceCulling()
 {
 	m_backfaceCullHS = !m_backfaceCullHS;
 	OutputDebugStringA(m_backfaceCullHS ? "[TESS] HS backface culling ON\n" : "[TESS] HS backface culling OFF\n");
+}
+
+// ── Лаба 8: PBR ─────────────────────────────────────────────────────────────
+
+void RenderingSystem::ScaleRoughness(float factor)
+{
+	m_roughnessScale *= factor;
+	m_roughnessScale = std::max(0.05f, std::min(m_roughnessScale, 4.0f));
+
+#if defined(_DEBUG)
+	char buf[64];
+	sprintf_s(buf, "[PBR] Roughness scale = %.2f\n", m_roughnessScale);
+	OutputDebugStringA(buf);
+#endif
+}
+
+void RenderingSystem::ToggleIbl()
+{
+	m_iblEnabled = !m_iblEnabled;
+	OutputDebugStringA(m_iblEnabled ? "[PBR] IBL ON\n" : "[PBR] IBL OFF (flat ambient)\n");
 }
 
 void RenderingSystem::ScaleDisplacement(float factor)

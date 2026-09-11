@@ -11,7 +11,9 @@ namespace {
 		// шейдеры по обе стороны работают с линейными значениями.
 		DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,  // Albedo
 		DXGI_FORMAT_R16G16B16A16_FLOAT,   // Normal
-		DXGI_FORMAT_R8G8B8A8_UNORM        // Specular
+		// Параметры материала PBR, а не цвет: гамма-кодировать их нельзя.
+		// r = metallic, g = roughness, b = ambient occlusion
+		DXGI_FORMAT_R8G8B8A8_UNORM        // Material
 	};
 
 	const float kClearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };

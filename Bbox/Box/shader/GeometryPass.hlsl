@@ -12,7 +12,12 @@
 // G-Buffer render targets:
 //   SV_Target0  Albedo    R8G8B8A8_UNORM      rgb = diffuse color
 //   SV_Target1  Normal    R16G16B16A16_FLOAT  xyz = world-space normal
-//   SV_Target2  Specular  R8G8B8A8_UNORM      rgb = Ks, a = Ns / 255
+//   SV_Target2  Material  R8G8B8A8_UNORM      r = metallic, g = roughness,
+//                                              b = ambient occlusion
+//
+// Lab 8 (lecture 09) replaced the Phong pair (Ks, Ns) in target 2 with the
+// metallic workflow: the light pass needs exactly metallic + roughness to
+// evaluate the Cook-Torrance BRDF.
 //=============================================================================
 
 Texture2D    gDiffuseMap      : register(t0);
@@ -43,14 +48,18 @@ cbuffer GeoPassCB : register(b1)
     uint   gNormalMapEnabled;
     uint   gFlipGreenChannel;
     uint   gBackfaceCullHS;
-    uint   _passPad0;
+    float  gRoughnessScale;   // lab 8: global roughness multiplier
 };
 
 cbuffer MaterialCB : register(b2)
 {
-    float4 gDiffuseAlbedo;    // Kd
-    float3 gSpecularColor;    // Ks
-    float  gSpecPower;        // Ns
+    float4 gDiffuseAlbedo;    // base color
+
+    float  gMetallic;         // 0 = dielectric, 1 = metal (lecture 09, slide 33)
+    float  gRoughness;        // derived from Ns at load time
+    float  gAmbientOcclusion;
+    float  _matPad0;
+
     float2 gUvScale;
     float2 gUvOffset;
     uint   gAlphaTest;
@@ -240,7 +249,7 @@ struct GBufferOut
 {
     float4 Albedo   : SV_Target0;
     float4 Normal   : SV_Target1;
-    float4 Specular : SV_Target2;
+    float4 Material : SV_Target2;
 };
 
 GBufferOut PS(PSInput pin, bool isFront : SV_IsFrontFace)
@@ -285,9 +294,11 @@ GBufferOut PS(PSInput pin, bool isFront : SV_IsFrontFace)
     o.Albedo   = float4(texColor * gDiffuseAlbedo.rgb, 1.0f);
     o.Normal   = float4(N, 0.0f);
 
-    // Ns in .mtl is in [0..1000]; the lab models stay under 255,
-    // so a simple /255 fits the UNORM alpha channel.
-    o.Specular = float4(gSpecularColor, saturate(gSpecPower / 255.0f));
+    // Material target. All three values already live in [0,1], so a plain
+    // UNORM format stores them exactly; no gamma encoding here, these are
+    // BRDF parameters and not color.
+    float roughness = saturate(gRoughness * gRoughnessScale);
+    o.Material = float4(saturate(gMetallic), roughness, saturate(gAmbientOcclusion), 1.0f);
 
     return o;
 }

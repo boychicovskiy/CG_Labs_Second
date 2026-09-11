@@ -12,11 +12,16 @@
 //
 // World position is NOT stored in the G-Buffer. It is reconstructed from the
 // depth buffer and the inverse view-projection matrix (slide 17).
+//
+// Lab 8 (lecture 09) replaced the Phong shading with the Cook-Torrance BRDF:
+// a microfacet model built from three terms - normal distribution D, geometry
+// G and Fresnel F (slide 22) - plus the energy conservation rule kD = 1 - kS
+// (slide 10) and the metallic workflow (slide 33).
 //=============================================================================
 
 Texture2D<float4>      gAlbedo    : register(t0);
 Texture2D<float4>      gNormal    : register(t1);
-Texture2D<float4>      gSpecular  : register(t2);
+Texture2D<float4>      gMaterial  : register(t2);   // r metallic, g roughness, b AO
 Texture2D<float>       gDepth     : register(t3);
 Texture2DArray<float>  gShadowMap : register(t4);   // one slice per cascade
 
@@ -34,7 +39,7 @@ cbuffer LightPassCB : register(b0)
 
     float2 gInvScreen;     // 1/width, 1/height
     uint   gDebugMode;     // 0 = off, 1..5 = show one G-Buffer channel
-    float  _lpPad1;
+    uint   gIblEnabled;    // lab 8: analytic environment instead of flat ambient
 
     float4 gAmbientColor;
 
@@ -69,6 +74,132 @@ cbuffer LightCB : register(b1)
 #define LIGHT_POINT       1
 #define LIGHT_SPOT        2
 #define LIGHT_AMBIENT     3
+
+#define PI 3.14159265359f
+
+//=============================================================================
+// Cook-Torrance BRDF (lecture 09)
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// Trowbridge-Reitz GGX normal distribution (slides 23, 24).
+//
+// D approximates the fraction of microfacets whose own normal points along the
+// halfway vector H - those are exactly the mirrors that send light from L into
+// V. Disney's reparametrisation alpha = roughness^2 is used, which makes the
+// artist-facing roughness slider perceptually linear.
+//-----------------------------------------------------------------------------
+float DistributionGGX(float NdotH, float roughness)
+{
+    float a  = roughness * roughness;
+    float a2 = a * a;
+
+    float d = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+
+    // The denominator goes to zero for a mirror (a2 -> 0) viewed exactly along
+    // H, so it is clamped - otherwise single bright pixels ("fireflies") appear.
+    return a2 / max(PI * d * d, 1e-7f);
+}
+
+//-----------------------------------------------------------------------------
+// Schlick-GGX geometry term with Smith's method (slides 25, 26, 27).
+//
+// G accounts for microfacets shadowing and masking each other. Smith splits it
+// into two independent factors: one for the view direction (obstruction) and
+// one for the light direction (shadowing).
+//
+// k for direct lighting is (roughness + 1)^2 / 8 (slide 25). The IBL variant
+// uses roughness^2 / 2 instead - that is the second formula on the same slide.
+//-----------------------------------------------------------------------------
+float GeometrySchlickGGX(float NdotX, float k)
+{
+    return NdotX / max(NdotX * (1.0f - k) + k, 1e-7f);
+}
+
+float GeometrySmith(float NdotV, float NdotL, float roughness)
+{
+    float r = roughness + 1.0f;
+    float k = (r * r) / 8.0f;
+
+    return GeometrySchlickGGX(NdotV, k) * GeometrySchlickGGX(NdotL, k);
+}
+
+//-----------------------------------------------------------------------------
+// Fresnel-Schlick approximation (slides 28, 29).
+//
+// F is the share of light reflected rather than refracted, and it grows towards
+// grazing angles - at 90 degrees every surface is a mirror. F0 is the base
+// reflectivity measured head-on.
+//-----------------------------------------------------------------------------
+float3 FresnelSchlick(float cosTheta, float3 F0)
+{
+    return F0 + (1.0f - F0) * pow(saturate(1.0f - cosTheta), 5.0f);
+}
+
+// Ambient light has no halfway vector, so N is substituted for H. That makes
+// the Fresnel effect too strong on rough surfaces, hence the roughness-aware
+// variant from slide 55.
+float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness)
+{
+    float3 fr = max(float3(1.0f - roughness, 1.0f - roughness, 1.0f - roughness), F0);
+    return F0 + (fr - F0) * pow(saturate(1.0f - cosTheta), 5.0f);
+}
+
+//=============================================================================
+// Analytic environment (a stand-in for IBL, slides 53-56 and 80)
+//
+// A full IBL pipeline needs three baked textures: an irradiance cube map, a
+// prefiltered environment cube map and a BRDF integration LUT. None of them
+// exist in this project yet, so the environment is evaluated analytically:
+// a two-lobe sky gradient plus Karis' analytic fit of the BRDF LUT. The
+// structure of the shading code is identical to slide 80 - only the three
+// texture fetches are replaced by closed-form functions.
+//=============================================================================
+
+// Radiance arriving from direction dir. gAmbientColor is the zenith color.
+float3 SkyRadiance(float3 dir)
+{
+    float3 zenith  = gAmbientColor.rgb;
+    float3 horizon = saturate(gAmbientColor.rgb * 1.5f + 0.08f);
+    float3 ground  = float3(0.10f, 0.09f, 0.08f);
+
+    float3 above = lerp(horizon, zenith, saturate(dir.y));
+    return lerp(ground, above, saturate(dir.y * 3.0f + 0.5f));
+}
+
+// Cosine-weighted convolution of that sky over the hemisphere around N.
+// For a gradient this smooth the integral collapses into another gradient,
+// which is what an irradiance map would have stored (slide 52).
+float3 SkyIrradiance(float3 N)
+{
+    float3 zenith  = gAmbientColor.rgb;
+    float3 horizon = saturate(gAmbientColor.rgb * 1.3f + 0.05f);
+    float3 ground  = float3(0.09f, 0.08f, 0.07f);
+
+    float3 above = lerp(horizon, zenith, saturate(N.y));
+    return lerp(ground, above, N.y * 0.5f + 0.5f);
+}
+
+// Prefiltered environment map stand-in: a rough surface reflects a wide lobe,
+// so it converges to the irradiance gradient; a smooth one reflects the sky
+// itself. Blurring by roughness is exactly what the mip chain of slide 59 does.
+float3 PrefilteredSky(float3 R, float roughness)
+{
+    return lerp(SkyRadiance(R), SkyIrradiance(R), roughness);
+}
+
+// Analytic replacement for the BRDF integration map of slides 69-79.
+// Karis' mobile approximation, accurate to a fraction of a percent.
+float2 EnvBRDFApprox(float NdotV, float roughness)
+{
+    const float4 c0 = float4(-1.0f, -0.0275f, -0.572f,  0.022f);
+    const float4 c1 = float4( 1.0f,  0.0425f,  1.040f, -0.040f);
+
+    float4 r = roughness * c0 + c1;
+    float  a = min(r.x * r.x, exp2(-9.28f * NdotV)) * r.x + r.y;
+
+    return float2(-1.04f, 1.04f) * a + r.zw;
+}
 
 //-----------------------------------------------------------------------------
 // Fullscreen triangle generated from SV_VertexID (lecture 03, slide 23).
@@ -193,20 +324,60 @@ float4 PS(float4 posH : SV_POSITION) : SV_Target
         discard;
 
     float3 albedo = gAlbedo.Load(pixel).rgb;
+    float3 N      = normalize(gNormal.Load(pixel).xyz);
 
-    // Ambient is a separate light source (slide 13): it must be added once,
-    // not once per light, otherwise the scene washes out.
-    if (gLightType == LIGHT_AMBIENT)
-        return float4(albedo * gAmbientColor.rgb * gIntensity, 1.0f);
-
-    float3 N = normalize(gNormal.Load(pixel).xyz);
-
-    float4 specData  = gSpecular.Load(pixel);
-    float3 specColor = specData.rgb;
-    float  specPower = max(specData.a * 255.0f, 1.0f);
+    float4 matData   = gMaterial.Load(pixel);
+    float  metallic  = saturate(matData.r);
+    float  roughness = clamp(matData.g, 0.05f, 1.0f);
+    float  ao        = saturate(matData.b);
 
     float3 posW = ReconstructWorldPos(posH.xy, depth);
+    float3 V    = normalize(gEyePosW - posW);
+    float  NdotV = saturate(dot(N, V));
 
+    // Base reflectivity (slide 33). Dielectrics reflect about 4% head-on and
+    // keep their diffuse colour; metals have no diffuse at all (slide 9) and
+    // their F0 is the albedo itself, tinted (slide 34).
+    float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+
+    //-------------------------------------------------------------------------
+    // Ambient / IBL pass. Added once per frame, not once per light.
+    //-------------------------------------------------------------------------
+    if (gLightType == LIGHT_AMBIENT)
+    {
+        float3 ambient;
+
+        if (gIblEnabled != 0)
+        {
+            // Slide 80, with the three texture fetches replaced by the
+            // analytic sky above.
+            float3 F  = FresnelSchlickRoughness(NdotV, F0, roughness);
+            float3 kS = F;
+            float3 kD = (1.0f - kS) * (1.0f - metallic);
+
+            float3 irradiance = SkyIrradiance(N);
+            float3 diffuse    = irradiance * albedo;
+
+            float3 R          = reflect(-V, N);
+            float3 prefiltered = PrefilteredSky(R, roughness);
+
+            float2 envBrdf = EnvBRDFApprox(NdotV, roughness);
+            float3 specular = prefiltered * (F * envBrdf.x + envBrdf.y);
+
+            ambient = (kD * diffuse + specular) * ao;
+        }
+        else
+        {
+            // The flat constant this replaces (slide 53), kept for comparison.
+            ambient = 0.03f * albedo * ao;
+        }
+
+        return float4(ambient * gIntensity, 1.0f);
+    }
+
+    //-------------------------------------------------------------------------
+    // Direct light: one term of the sum on slide 17.
+    //-------------------------------------------------------------------------
     float3 L           = float3(0.0f, 1.0f, 0.0f);
     float  attenuation = 1.0f;
 
@@ -238,12 +409,17 @@ float4 PS(float4 posH : SV_POSITION) : SV_Target
         }
     }
 
-    float  nDotL   = saturate(dot(N, L));
+    float3 H     = normalize(V + L);
+    float  NdotL = saturate(dot(N, L));
+    float  NdotH = saturate(dot(N, H));
+    float  HdotV = saturate(dot(H, V));
+
+    // Li in the reflectance equation.
     float3 radiance = gLightColor * gIntensity * attenuation;
 
     // Only the directional light casts shadows here: cascades are built for an
     // orthographic projection. A point light would need a cube map and a spot
-    // light its own perspective map (slide 13).
+    // light its own perspective map (lecture 06, slide 13).
     if (gShadowsEnabled != 0 && gLightType == LIGHT_DIRECTIONAL)
     {
         uint cascade = SelectCascade(posW);
@@ -253,17 +429,25 @@ float4 PS(float4 posH : SV_POSITION) : SV_Target
             radiance *= CascadeColor(cascade);
     }
 
-    float3 diffuse = albedo * radiance * nDotL;
+    //-------------------------------------------------------------------------
+    // Cook-Torrance specular: D * G * F / (4 * (N.V) * (N.L))   (slides 21, 35)
+    //-------------------------------------------------------------------------
+    float  D = DistributionGGX(NdotH, roughness);
+    float  G = GeometrySmith(NdotV, NdotL, roughness);
+    float3 F = FresnelSchlick(HdotV, F0);
 
-    // Phong specular. Zero it out on unlit faces, otherwise highlights show up
-    // on surfaces that face away from the light.
-    float3 V    = normalize(gEyePosW - posW);
-    float3 R    = reflect(-L, N);
-    float  spec = (nDotL > 0.0f) ? pow(saturate(dot(R, V)), specPower) : 0.0f;
+    float3 specular = (D * G * F) / max(4.0f * NdotV * NdotL, 1e-4f);
 
-    float3 specular = specColor * radiance * spec;
+    // Energy conservation (slide 10): F already IS the reflected fraction kS,
+    // so the refracted fraction is what is left of it. Metals absorb all of
+    // the refracted light, so their diffuse term is zeroed out (slide 9).
+    float3 kD = (1.0f - F) * (1.0f - metallic);
 
-    return float4(diffuse + specular, 1.0f);
+    // Lambert diffuse is divided by PI (slide 20) - without it the surface
+    // would emit more energy than it receives.
+    float3 Lo = (kD * albedo / PI + specular) * radiance * NdotL;
+
+    return float4(Lo, 1.0f);
 }
 
 //-----------------------------------------------------------------------------
@@ -283,13 +467,14 @@ float4 PS_Debug(float4 posH : SV_POSITION) : SV_Target
         return float4(n * 0.5f + 0.5f, 1.0f);   // [-1..1] -> [0..1]
     }
 
+    // Material target as it is stored: red = metallic, green = roughness.
     if (gDebugMode == 3)
-        return float4(gSpecular.Load(pixel).rgb, 1.0f);
+        return float4(gMaterial.Load(pixel).rgb, 1.0f);
 
     if (gDebugMode == 4)
     {
-        float ns = gSpecular.Load(pixel).a;
-        return float4(ns, ns, ns, 1.0f);
+        float r = gMaterial.Load(pixel).g;
+        return float4(r, r, r, 1.0f);
     }
 
     if (gDebugMode == 5)

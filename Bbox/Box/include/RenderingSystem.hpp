@@ -133,6 +133,12 @@ public:
 	void ScaleExposure(float f)     { m_post.ScaleExposure(f); }
 	void ScaleBloomThreshold(float f) { m_post.ScaleBloomThreshold(f); }
 
+	// ── Лаба 8: PBR ─────────────────────────────────────────────────────────
+	void  ScaleRoughness(float factor);
+	void  ToggleIbl();
+	float RoughnessScale() const { return m_roughnessScale; }
+	bool  IblEnabled()     const { return m_iblEnabled; }
+
 	const CullStats& FieldStats()   const { return m_objectField.Stats(); }
 	size_t OctreeNodeCount()        const { return m_objectField.OctreeNodeCount(); }
 	int    OctreeDepth()            const { return m_objectField.OctreeDepth(); }
@@ -248,6 +254,10 @@ private:
 	bool  m_normalMapEnabled  = true;
 	bool  m_flipGreenChannel  = false;
 	bool  m_backfaceCullHS    = false;
+
+	// ── PBR (лаба 8) ────────────────────────────────────────────────────────
+	float m_roughnessScale = 1.0f;   // глобальный множитель к roughness
+	bool  m_iblEnabled     = true;   // аналитическое окружение вместо ambient
 
 	float m_displacementScale = 0.008f;
 	float m_tessFactorMax     = 8.0f;

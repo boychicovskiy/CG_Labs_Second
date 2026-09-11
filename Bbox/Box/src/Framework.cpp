@@ -400,6 +400,11 @@ void Framework::HandleKeyboardShortcuts()
 
 	if (JustPressed('8')) m_renderer->ScaleBloomThreshold(0.8f);
 	if (JustPressed('9')) m_renderer->ScaleBloomThreshold(1.25f);
+
+	// ── Лаба 8: PBR ─────────────────────────────────────────────────────────
+	if (JustPressed('V'))          m_renderer->ToggleIbl();
+	if (JustPressed(VK_OEM_1))     m_renderer->ScaleRoughness(0.8f);    // ;
+	if (JustPressed(VK_OEM_7))     m_renderer->ScaleRoughness(1.25f);   // '
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -426,10 +431,14 @@ void Framework::UpdateWindowTitle(double dt)
 
 	const wchar_t* frozen = m_renderer->FrustumFrozen() ? L"  |  FRUSTUM FROZEN (P)" : L"";
 
-	wchar_t buf[320];
-	swprintf_s(buf, L"CG Lab  |  %.0f FPS  |  cull: %s  |  drawn %u / %u  |  AABB tests %u  |  %.3f ms  |  octree %zu nodes, depth %d%s",
+	// Лаба 8: состояние PBR тоже выводим в заголовок.
+	const wchar_t* ibl = m_renderer->IblEnabled() ? L"IBL" : L"flat";
+
+	wchar_t buf[384];
+	swprintf_s(buf, L"CG Lab  |  %.0f FPS  |  cull: %s  |  drawn %u / %u  |  AABB tests %u  |  %.3f ms  |  octree %zu nodes, depth %d  |  ambient: %s  |  rough x%.2f%s",
 	           fps, modeName, s.drawnObjects, s.totalObjects, s.aabbTests, s.cullMs,
-	           m_renderer->OctreeNodeCount(), m_renderer->OctreeDepth(), frozen);
+	           m_renderer->OctreeNodeCount(), m_renderer->OctreeDepth(),
+	           ibl, m_renderer->RoughnessScale(), frozen);
 
 	if (HWND hwnd = MainWnd())
 		SetWindowTextW(hwnd, buf);

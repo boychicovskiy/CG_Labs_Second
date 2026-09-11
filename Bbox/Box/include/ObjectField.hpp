@@ -28,9 +28,12 @@ struct CullStats {
 
 // Данные одного экземпляра. Ровно 48 байт, поступают вторым вершинным
 // потоком с D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA.
+//
+// Лаба 8: два слова выравнивания, которые раньше были пустыми, теперь несут
+// параметры PBR. Размер записи и шаг потока не изменились — только смысл w.
 struct InstanceData {
-	DirectX::XMFLOAT3 Center;  float _pad0 = 0.0f;
-	DirectX::XMFLOAT3 Extent;  float _pad1 = 0.0f;
+	DirectX::XMFLOAT3 Center;  float Metallic  = 0.0f;
+	DirectX::XMFLOAT3 Extent;  float Roughness = 0.5f;
 	DirectX::XMFLOAT4 Color;
 };
 
@@ -125,6 +128,10 @@ private:
 	// Сцена
 	std::vector<AABB>              m_objectBounds;
 	std::vector<DirectX::XMFLOAT4> m_objectColors;
+
+	// Лаба 8: x = metallic, y = roughness. Заполняются по нормированной
+	// позиции объекта, так что поле образует таблицу материалов.
+	std::vector<DirectX::XMFLOAT2> m_objectMaterial;
 	Octree                         m_octree;
 
 	// Переиспользуемые буферы, чтобы не аллоцировать каждый кадр

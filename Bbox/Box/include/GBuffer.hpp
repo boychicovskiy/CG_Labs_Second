@@ -10,7 +10,7 @@
 // Раскладка (3 таргета + глубина):
 //   t0  Albedo    R8G8B8A8_UNORM        rgb = диффузный цвет, a = 1
 //   t1  Normal    R16G16B16A16_FLOAT    xyz = мировая нормаль (без упаковки)
-//   t2  Specular  R8G8B8A8_UNORM        rgb = Ks, a = Ns / 255
+//   t2  Material  R8G8B8A8_UNORM        r = metallic, g = roughness, b = AO
 //   t3  Depth     R24_UNORM_X8_TYPELESS (SRV на depth-buffer из Framework)
 //
 // Мировые координаты НЕ храним — они избыточны (слайд 17): в light pass
@@ -26,7 +26,7 @@ public:
 	enum RtIndex : UINT {
 		RT_Albedo   = 0,
 		RT_Normal   = 1,
-		RT_Specular = 2,
+		RT_Material = 2,   // лаба 8: metallic/roughness вместо Ks/Ns
 		RT_Count    = 3
 	};
 

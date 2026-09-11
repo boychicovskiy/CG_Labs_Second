@@ -77,7 +77,7 @@ struct GBufferOut
 {
     float4 Albedo   : SV_Target0;
     float4 Normal   : SV_Target1;
-    float4 Specular : SV_Target2;
+    float4 Material : SV_Target2;   // r = metallic, g = roughness, b = AO
 };
 
 //-----------------------------------------------------------------------------
@@ -156,7 +156,9 @@ GBufferOut PS(GSOut pin)
 
     o.Albedo   = float4(pin.Color.rgb, 1.0f);
     o.Normal   = float4(sphereN, 0.0f);
-    o.Specular = float4(0.15f, 0.12f, 0.08f, 16.0f / 255.0f);
+    // Sparks are not metal and they are rough: the point of the particle is
+    // its own emission, not a mirror highlight from the scene lights.
+    o.Material = float4(0.0f, 0.9f, 1.0f, 1.0f);
 
     return o;
 }
