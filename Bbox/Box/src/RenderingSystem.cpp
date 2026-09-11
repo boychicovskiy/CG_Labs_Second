@@ -72,6 +72,7 @@ void RenderingSystem::Init(ID3D12Device* device,
 	BuildShadowPSO(device);
 
 	m_gbuffer.Init(device);
+	m_post.Init(device, m_backBufferFormat);   // формат RTV бэк-буфера (_SRGB)
 
 	// ── ДЗ №5: каскадные карты теней ────────────────────────────────────────
 	m_shadowMap.Init(device, /*size*/ 2048, /*cascades*/ ShadowMap::MaxCascades);
@@ -611,7 +612,7 @@ void RenderingSystem::BuildLightPSO(ID3D12Device* device)
 	pso.SampleMask            = D3D12_DEFAULT_SAMPLE_MASK;
 	pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	pso.NumRenderTargets      = 1;
-	pso.RTVFormats[0]         = m_backBufferFormat;
+	pso.RTVFormats[0]         = PostProcess::HdrFormat;
 	pso.DSVFormat             = DXGI_FORMAT_UNKNOWN;
 	pso.SampleDesc.Count      = 1;
 
@@ -1075,13 +1076,31 @@ void RenderingSystem::BuildMaterialSrvHeap(ID3D12Device* device)
 
 	D3D12_CPU_DESCRIPTOR_HANDLE handle = m_matSrvHeap->GetCPUDescriptorHandleForHeapStart();
 
-	auto MakeSrv = [&](ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE h)
+	// Диффузные карты хранят ЦВЕТ и уже гамма-закодированы, поэтому читать их
+	// надо через формат _SRGB — аппаратура переведёт выборку в линейное
+	// пространство. Карты нормалей, высот и альфа-маски цветом не являются,
+	// к ним гамма-преобразование применять нельзя (лекция 08.1, слайд 42).
+	auto ToSrgb = [](DXGI_FORMAT f) -> DXGI_FORMAT
+	{
+		switch (f)
+		{
+		case DXGI_FORMAT_BC1_UNORM:      return DXGI_FORMAT_BC1_UNORM_SRGB;
+		case DXGI_FORMAT_BC2_UNORM:      return DXGI_FORMAT_BC2_UNORM_SRGB;
+		case DXGI_FORMAT_BC3_UNORM:      return DXGI_FORMAT_BC3_UNORM_SRGB;
+		case DXGI_FORMAT_BC7_UNORM:      return DXGI_FORMAT_BC7_UNORM_SRGB;
+		case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		default:                         return f;   // формат без sRGB-варианта
+		}
+	};
+
+	auto MakeSrv = [&](ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE h, bool srgb = false)
 	{
 		ID3D12Resource* target = res ? res : m_whiteTex.Get();
 		D3D12_RESOURCE_DESC desc = target->GetDesc();
 
 		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-		srv.Format                        = desc.Format;
+		srv.Format                        = srgb ? ToSrgb(desc.Format) : desc.Format;
 		srv.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srv.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srv.Texture2D.MostDetailedMip     = 0;
@@ -1095,7 +1114,7 @@ void RenderingSystem::BuildMaterialSrvHeap(ID3D12Device* device)
 	// Порядок внутри четвёрки совпадает с регистрами t0..t3 в шейдере
 	for (const auto& mat : m_materials)
 	{
-		MakeSrv(mat.diffuseTex.Get(), handle);  handle.ptr += m_srvDescSize;  // t0
+		MakeSrv(mat.diffuseTex.Get(), handle, /*srgb*/ true);  handle.ptr += m_srvDescSize;  // t0
 		MakeSrv(mat.alphaTex.Get(),   handle);  handle.ptr += m_srvDescSize;  // t1
 		MakeSrv(mat.normalTex.Get(),  handle);  handle.ptr += m_srvDescSize;  // t2
 		MakeSrv(mat.dispTex.Get(),    handle);  handle.ptr += m_srvDescSize;  // t3
@@ -1205,6 +1224,7 @@ void RenderingSystem::OnResize(ID3D12Device* device, UINT width, UINT height,
                                ID3D12Resource* depthBuffer)
 {
 	m_gbuffer.Resize(device, width, height, depthBuffer);
+	m_post.Resize(device, width, height);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1520,9 +1540,13 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 	// ═══════════════════════════════════════════════════════════════════════
 	m_gbuffer.TransitionToRead(cmd);
 
+	// Свет накапливается в HDR-буфере с плавающей точкой, а не в 8-битном
+	// бэк-буфере: иначе яркие места обрежутся на единице (лекция 08.2, слайд 5).
+	m_post.BeginScene(cmd);
+
 	// DSV не привязываем: depth сейчас читается как SRV (t3)
-	cmd->OMSetRenderTargets(1, &backBufferRtv, FALSE, nullptr);
-	cmd->ClearRenderTargetView(backBufferRtv, DirectX::Colors::Black, 0, nullptr);
+	D3D12_CPU_DESCRIPTOR_HANDLE hdrRtv = m_post.HdrRtv();
+	cmd->OMSetRenderTargets(1, &hdrRtv, FALSE, nullptr);
 
 	cmd->SetGraphicsRootSignature(m_lightRootSig.Get());
 
@@ -1558,6 +1582,14 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 			cmd->DrawInstanced(3, 1, 0, 0);
 		}
 	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// ПРОХОД 3: Постобработка (лаба 7) → HDR в бэк-буфер
+	// ═══════════════════════════════════════════════════════════════════════
+	// Отладочные виды G-Buffer показываем как есть, без тонального
+	// отображения и свечения — иначе нормали и глубина исказятся.
+	m_post.SetPassthrough(m_debugMode != 0);
+	m_post.Execute(cmd, backBufferRtv, viewport, scissor);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

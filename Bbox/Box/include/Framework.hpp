@@ -86,7 +86,12 @@ private:
 	ComPtr<IDXGISwapChain4> m_swapChain;
 	int                     m_currBackBuffer = 0;
 
-	DXGI_FORMAT m_backBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+	// Swap chain обязан быть в «сыром» UNORM: flip-модель не принимает
+	// _SRGB-формат для самой цепочки. Зато RTV на те же буферы можно создать
+	// с форматом _SRGB — тогда гамма-кодирование делает аппаратура
+	// (лекция 08.1, слайд 43).
+	DXGI_FORMAT m_backBufferFormat    = DXGI_FORMAT_R8G8B8A8_UNORM;
+	DXGI_FORMAT m_backBufferRtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
 	// Depth хранится в TYPELESS-формате: DSV смотрит на него как
 	// D24_UNORM_S8_UINT, а GBuffer создаёт SRV как R24_UNORM_X8_TYPELESS,

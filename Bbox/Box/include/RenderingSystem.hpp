@@ -13,6 +13,7 @@
 #include "ObjectField.hpp"
 #include "ShadowMap.hpp"
 #include "ParticleSystem.hpp"
+#include "PostProcess.hpp"
 
 // Диапазон вершин с одним материалом
 struct SubMesh {
@@ -123,6 +124,14 @@ public:
 	void ToggleParticles()      { m_particles.ToggleEnabled(); }
 	void ResetParticles()       { m_particles.Reset(); }
 	void ScaleEmission(float f) { m_particles.ScaleEmissionRate(f); }
+
+	// ── Лаба 7: пост-эффекты ────────────────────────────────────────────────
+	void ToggleBloom()              { m_post.ToggleBloom(); }
+	void ToggleDither()             { m_post.ToggleDither(); }
+	void ToggleVignette()           { m_post.ToggleVignette(); }
+	void CycleToneMap()             { m_post.CycleToneMap(); }
+	void ScaleExposure(float f)     { m_post.ScaleExposure(f); }
+	void ScaleBloomThreshold(float f) { m_post.ScaleBloomThreshold(f); }
 
 	const CullStats& FieldStats()   const { return m_objectField.Stats(); }
 	size_t OctreeNodeCount()        const { return m_objectField.OctreeNodeCount(); }
@@ -252,6 +261,7 @@ private:
 	// ── Каскадные тени (ДЗ №5) ──────────────────────────────────────────────
 	ShadowMap      m_shadowMap;
 	ParticleSystem m_particles;
+	PostProcess    m_post;
 	bool      m_shadowsEnabled = true;
 	bool      m_showCascades   = false;
 	float     m_shadowBias     = 0.0018f;

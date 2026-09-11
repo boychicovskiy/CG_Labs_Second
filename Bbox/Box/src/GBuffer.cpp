@@ -5,7 +5,11 @@
 namespace {
 	// Форматы таргетов G-Buffer. Порядок совпадает с RtIndex.
 	const DXGI_FORMAT kRtFormats[GBuffer::RT_Count] = {
-		DXGI_FORMAT_R8G8B8A8_UNORM,       // Albedo
+		// Альбедо хранится в sRGB: это ЦВЕТОВЫЕ данные, и 8 бит на канал
+		// в линейном пространстве дают полосы в тенях (лекция 08.1, слайд 51).
+		// Аппаратура кодирует при записи и декодирует при чтении, так что
+		// шейдеры по обе стороны работают с линейными значениями.
+		DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,  // Albedo
 		DXGI_FORMAT_R16G16B16A16_FLOAT,   // Normal
 		DXGI_FORMAT_R8G8B8A8_UNORM        // Specular
 	};

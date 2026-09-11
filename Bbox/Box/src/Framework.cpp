@@ -57,7 +57,7 @@ bool Framework::Init() {
 		m_commandQueue.Get(),
 		m_directCmdListAlloc.Get(),
 		m_commandList.Get(),
-		m_backBufferFormat,
+		m_backBufferRtvFormat,     // цель композита постобработки
 		m_depthStencilFormat);
 
 	// OnResize создаёт depth-буфер и отдаёт его в G-Buffer
@@ -248,10 +248,16 @@ void Framework::OnResize()
 
 	m_currBackBuffer = static_cast<int>(m_swapChain->GetCurrentBackBufferIndex());
 
+	// RTV с форматом _SRGB: шейдер отдаёт линейный цвет, а кодированием
+	// в гамма-пространство занимается блок вывода (лекция 08.1, слайд 43).
+	D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+	rtvDesc.Format        = m_backBufferRtvFormat;
+	rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
 	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
 	for (UINT i = 0; i < SwapChainBufferCount; ++i) {
 		ThrowIfFailed(m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_swapChainBuffer[i])));
-		m_device->CreateRenderTargetView(m_swapChainBuffer[i].Get(), nullptr, rtvHandle);
+		m_device->CreateRenderTargetView(m_swapChainBuffer[i].Get(), &rtvDesc, rtvHandle);
 		rtvHandle.ptr += m_rtvDescriptorSize;
 	}
 
@@ -382,6 +388,18 @@ void Framework::HandleKeyboardShortcuts()
 	if (JustPressed('R')) m_renderer->ResetParticles();
 	if (JustPressed('Z')) m_renderer->ScaleEmission(0.7f);
 	if (JustPressed('X')) m_renderer->ScaleEmission(1.4f);
+
+	// ── Лаба 7: пост-эффекты ────────────────────────────────────────────────
+	if (JustPressed('4')) m_renderer->ToggleBloom();
+	if (JustPressed('5')) m_renderer->CycleToneMap();
+	if (JustPressed('6')) m_renderer->ToggleDither();
+	if (JustPressed('7')) m_renderer->ToggleVignette();
+
+	if (JustPressed('Q')) m_renderer->ScaleExposure(0.8f);
+	if (JustPressed('E')) m_renderer->ScaleExposure(1.25f);
+
+	if (JustPressed('8')) m_renderer->ScaleBloomThreshold(0.8f);
+	if (JustPressed('9')) m_renderer->ScaleBloomThreshold(1.25f);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
