@@ -368,6 +368,14 @@ void Framework::HandleKeyboardShortcuts()
 	if (JustPressed('3')) m_renderer->SetCullMode(CullMode::Octree);
 	if (JustPressed('O')) m_renderer->ToggleOctreeBoxes();
 	if (JustPressed('P')) m_renderer->ToggleFrustumFreeze();
+
+	// ── ДЗ №5: каскадные тени ───────────────────────────────────────────────
+	if (JustPressed('H')) m_renderer->ToggleShadows();
+	if (JustPressed('M')) m_renderer->ToggleCascadeView();
+	if (JustPressed('K')) m_renderer->ScaleShadowBias(0.75f);
+	if (JustPressed('L')) m_renderer->ScaleShadowBias(1.33f);
+	if (JustPressed('U')) m_renderer->ScaleCascadeLambda(-0.05f);
+	if (JustPressed('I')) m_renderer->ScaleCascadeLambda(+0.05f);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -448,12 +456,18 @@ void Framework::Update(const double& dt)
 		? static_cast<float>(m_clientWidth) / static_cast<float>(m_clientHeight)
 		: 1.0f;
 
-	XMMATRIX proj = XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 100.0f);
+	// Параметры проекции держим явно: по ним каскадные тени режут фрустум
+	const float fovY  = 0.25f * XM_PI;
+	const float nearZ = 0.05f;
+	const float farZ  = 100.0f;
+
+	XMMATRIX proj = XMMatrixPerspectiveFovLH(fovY, aspect, nearZ, farZ);
 
 	if (m_renderer)
 		m_renderer->Update(dt, view, proj, m_camPos,
 		                   static_cast<UINT>(m_clientWidth),
-		                   static_cast<UINT>(m_clientHeight));
+		                   static_cast<UINT>(m_clientHeight),
+		                   fovY, aspect, nearZ, farZ);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

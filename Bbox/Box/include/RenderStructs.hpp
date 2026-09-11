@@ -74,6 +74,12 @@ struct alignas(16) InstancePassConstants {
 	DirectX::XMFLOAT4X4 ViewProj = dx::Identity4x4();
 };
 
+// b0 прохода карты теней (ДЗ №5). Один элемент на каскад.
+struct alignas(16) ShadowPassConstants {
+	DirectX::XMFLOAT4X4 LightViewProj = dx::Identity4x4();
+	DirectX::XMFLOAT4X4 World         = dx::Identity4x4();
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LIGHT PASS — константные буферы
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +119,21 @@ struct alignas(16) LightPassConstants {
 	float             _pad1         = 0.0f;
 
 	DirectX::XMFLOAT4 AmbientColor = { 0.12f, 0.12f, 0.14f, 1.0f };
+
+	// ── Каскадные тени (ДЗ №5) ──────────────────────────────────────────────
+	DirectX::XMFLOAT4X4 View = dx::Identity4x4();          // нужна, чтобы получить
+	                                                        // глубину в пространстве камеры
+
+	DirectX::XMFLOAT4X4 CascadeViewProj[4] = {
+		dx::Identity4x4(), dx::Identity4x4(), dx::Identity4x4(), dx::Identity4x4()
+	};
+
+	DirectX::XMFLOAT4 CascadeSplits = { 0.0f, 0.0f, 0.0f, 0.0f };  // дальние границы
+
+	uint32_t ShadowsEnabled  = 1;
+	uint32_t ShowCascades    = 0;    // подкрасить каскады разными цветами
+	float    ShadowBias      = 0.0018f;
+	float    ShadowTexelSize = 1.0f / 2048.0f;
 };
 
 static_assert(sizeof(Vertex)              == 48,     "Vertex stride must stay 48 bytes.");

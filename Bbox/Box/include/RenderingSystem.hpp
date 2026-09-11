@@ -11,6 +11,7 @@
 #include "RenderStructs.hpp"
 #include "GBuffer.hpp"
 #include "ObjectField.hpp"
+#include "ShadowMap.hpp"
 
 // Диапазон вершин с одним материалом
 struct SubMesh {
@@ -67,11 +68,14 @@ public:
 	void OnResize(ID3D12Device* device, UINT width, UINT height, ID3D12Resource* depthBuffer);
 
 	// Обновляет константные буферы. Матрицы приходят готовыми из Framework.
+	// fovY/aspect/nearZ/farZ нужны для построения каскадов: они режут
+	// фрустум камеры, а не берут готовую матрицу проекции.
 	void Update(double dt,
 	            const DirectX::XMMATRIX& view,
 	            const DirectX::XMMATRIX& proj,
 	            const DirectX::XMFLOAT3& eyePos,
-	            UINT width, UINT height);
+	            UINT width, UINT height,
+	            float fovY, float aspect, float nearZ, float farZ);
 
 	// Пишет команды обоих проходов в cmdList.
 	void Render(ID3D12GraphicsCommandList* cmd,
@@ -107,6 +111,13 @@ public:
 	void ToggleFrustumFreeze();
 	bool FrustumFrozen() const { return m_freezeFrustum; }
 
+	// ── ДЗ №5 ───────────────────────────────────────────────────────────────
+	void ToggleShadows();
+	void ToggleCascadeView();
+	void ScaleShadowBias(float factor);
+	void ScaleCascadeLambda(float delta);
+	bool ShadowsEnabled() const { return m_shadowsEnabled; }
+
 	const CullStats& FieldStats()   const { return m_objectField.Stats(); }
 	size_t OctreeNodeCount()        const { return m_objectField.OctreeNodeCount(); }
 	int    OctreeDepth()            const { return m_objectField.OctreeDepth(); }
@@ -122,6 +133,9 @@ private:
 	void BuildGeometryPSO(ID3D12Device* device);
 	void BuildTessellationPSO(ID3D12Device* device);
 	void BuildLightPSO(ID3D12Device* device);
+	void BuildShadowRootSignature(ID3D12Device* device);
+	void BuildShadowPSO(ID3D12Device* device);
+	void RenderShadowPass(ID3D12GraphicsCommandList* cmd);
 	void BuildConstantBuffers(ID3D12Device* device);
 
 	void CreateWhiteTexture(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
@@ -149,6 +163,7 @@ private:
 	ComPtr<ID3DBlob> m_geoVS, m_geoPS;
 	ComPtr<ID3DBlob> m_geoVSTess, m_geoHS, m_geoDS;
 	ComPtr<ID3DBlob> m_lightVS, m_lightPS, m_debugPS;
+	ComPtr<ID3DBlob> m_shadowVS, m_shadowVSInstanced;
 
 	// ── Root signatures / PSO ───────────────────────────────────────────────
 	ComPtr<ID3D12RootSignature> m_geoRootSig;
@@ -161,15 +176,21 @@ private:
 	ComPtr<ID3D12PipelineState> m_lightPSO;
 	ComPtr<ID3D12PipelineState> m_debugPSO;
 
+	ComPtr<ID3D12RootSignature> m_shadowRootSig;
+	ComPtr<ID3D12PipelineState> m_shadowPSO;           // статическая геометрия
+	ComPtr<ID3D12PipelineState> m_shadowPSOInstanced;  // поле коробок
+
 	// ── Константные буферы ──────────────────────────────────────────────────
 	std::unique_ptr<UploadBuffer<ObjectConstants>>     m_objectCB;
 	std::unique_ptr<UploadBuffer<GeoPassConstants>>    m_geoPassCB;
 	std::unique_ptr<UploadBuffer<MaterialConstants>>   m_materialCB;   // по элементу на материал
 	std::unique_ptr<UploadBuffer<LightPassConstants>>  m_lightPassCB;
 	std::unique_ptr<UploadBuffer<LightConstants>>      m_lightCB;      // по элементу на источник
+	std::unique_ptr<UploadBuffer<ShadowPassConstants>> m_shadowCB;     // по элементу на каскад
 
 	UINT m_materialCBStride = 0;   // выровненный размер элемента (256)
 	UINT m_lightCBStride    = 0;
+	UINT m_shadowCBStride   = 0;
 
 	// ── Сцена ───────────────────────────────────────────────────────────────
 	ComPtr<ID3D12Resource>   m_modelVB;
@@ -221,6 +242,12 @@ private:
 	// ── Поле объектов и отсечение (ДЗ №4) ───────────────────────────────────
 	ObjectField m_objectField;
 	CullMode    m_cullMode = CullMode::Octree;
+
+	// ── Каскадные тени (ДЗ №5) ──────────────────────────────────────────────
+	ShadowMap m_shadowMap;
+	bool      m_shadowsEnabled = true;
+	bool      m_showCascades   = false;
+	float     m_shadowBias     = 0.0018f;
 
 	bool              m_freezeFrustum  = false;
 	DirectX::XMFLOAT4X4 m_frozenViewProj = dx::Identity4x4();

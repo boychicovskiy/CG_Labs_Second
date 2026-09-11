@@ -68,8 +68,15 @@ void RenderingSystem::Init(ID3D12Device* device,
 	BuildGeometryPSO(device);
 	BuildTessellationPSO(device);
 	BuildLightPSO(device);
+	BuildShadowRootSignature(device);
+	BuildShadowPSO(device);
 
 	m_gbuffer.Init(device);
+
+	// ── ДЗ №5: каскадные карты теней ────────────────────────────────────────
+	m_shadowMap.Init(device, /*size*/ 2048, /*cascades*/ ShadowMap::MaxCascades);
+	// SRV массива каскадов кладём в кучу G-Buffer — слот t4
+	m_gbuffer.SetShadowSrv(device, m_shadowMap.Resource(), m_shadowMap.CascadeCount());
 
 	// ── Одноразовая заливка текстур и вершинного буфера ─────────────────────
 	// uploadKeepAlive держит промежуточные UPLOAD-ресурсы живыми до тех пор,
@@ -144,6 +151,11 @@ void RenderingSystem::BuildShaders()
 	m_lightVS = CompileShader(lightFile, nullptr, "VS", "vs_5_1");
 	m_lightPS = CompileShader(lightFile, nullptr, "PS", "ps_5_1");
 	m_debugPS = CompileShader(lightFile, nullptr, "PS_Debug", "ps_5_1");
+
+	// Проход карты теней — только вершинные шейдеры, пиксельного нет вовсе
+	const std::wstring shadowFile = L"shader\\ShadowPass.hlsl";
+	m_shadowVS          = CompileShader(shadowFile, nullptr, "VS",           "vs_5_1");
+	m_shadowVSInstanced = CompileShader(shadowFile, nullptr, "VS_Instanced", "vs_5_1");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -249,11 +261,30 @@ void RenderingSystem::BuildLightRootSignature(ID3D12Device* device)
 	params[2].DescriptorTable.pDescriptorRanges   = &srvRange;
 	params[2].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
 
+	// Сэмплер сравнения для карты теней (слайд 40): фильтрация LINEAR даёт
+	// аппаратный PCF 2×2 внутри одной выборки SampleCmp.
+	D3D12_STATIC_SAMPLER_DESC shadowSampler = {};
+	shadowSampler.Filter           = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+	shadowSampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+	shadowSampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+	shadowSampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+	shadowSampler.MipLODBias       = 0.0f;
+	shadowSampler.MaxAnisotropy    = 1;
+	// LESS_EQUAL: глубина пикселя не больше сохранённой → он освещён (1.0)
+	shadowSampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+	// Белая граница: всё за пределами карты считается освещённым
+	shadowSampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+	shadowSampler.MinLOD           = 0.0f;
+	shadowSampler.MaxLOD           = D3D12_FLOAT32_MAX;
+	shadowSampler.ShaderRegister   = 0;
+	shadowSampler.RegisterSpace    = 0;
+	shadowSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
 	D3D12_ROOT_SIGNATURE_DESC desc = {};
 	desc.NumParameters     = _countof(params);
 	desc.pParameters       = params;
-	desc.NumStaticSamplers = 0;
-	desc.pStaticSamplers   = nullptr;
+	desc.NumStaticSamplers = 1;
+	desc.pStaticSamplers   = &shadowSampler;
 	// Input layout не нужен — вершины генерирует VS из SV_VertexID.
 	desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -428,6 +459,112 @@ void RenderingSystem::BuildTessellationPSO(ID3D12Device* device)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Root signature прохода карты теней: один root CBV, всё остальное запрещено
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildShadowRootSignature(ID3D12Device* device)
+{
+	D3D12_ROOT_PARAMETER param = {};
+	param.ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	param.Descriptor.ShaderRegister = 0;
+	param.ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+
+	D3D12_ROOT_SIGNATURE_DESC desc = {};
+	desc.NumParameters = 1;
+	desc.pParameters   = &param;
+	desc.Flags =
+		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+		D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+		D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+		D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+		D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+
+	ComPtr<ID3DBlob> blob, errors;
+	HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1,
+	                                         blob.GetAddressOf(), errors.GetAddressOf());
+	if (errors) OutputDebugStringA((const char*)errors->GetBufferPointer());
+	ThrowIfFailed(hr);
+
+	ThrowIfFailed(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+	                                          IID_PPV_ARGS(&m_shadowRootSig)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PSO прохода карты теней (лекция 06, слайды 14, 18–20)
+//
+// Ни одного render target'а и пустой пиксельный шейдер — пишется только
+// глубина. Смещение задаётся состоянием растеризатора, а не в шейдере:
+// SlopeScaledDepthBias учитывает наклон полигона, что и нужно против
+// «shadow acne» на поверхностях под углом к свету.
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::BuildShadowPSO(ID3D12Device* device)
+{
+	// Из всей вершины нужна только позиция; остальные поля просто пропускаем
+	D3D12_INPUT_ELEMENT_DESC staticLayout[] =
+	{
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+		  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+	};
+
+	D3D12_INPUT_ELEMENT_DESC instancedLayout[] =
+	{
+		{ "POSITION",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0,
+		  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,   0 },
+		{ "INSTCENTER", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1,  0,
+		  D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+		{ "INSTEXTENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16,
+		  D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+	};
+
+	D3D12_RASTERIZER_DESC raster = {};
+	raster.FillMode              = D3D12_FILL_MODE_SOLID;
+	raster.CullMode              = D3D12_CULL_MODE_NONE;
+	raster.FrontCounterClockwise = FALSE;
+	// Постоянное смещение в единицах младшего бита буфера глубины
+	raster.DepthBias             = 1200;
+	// Ограничитель: на полигонах под острым углом формула наклона даёт
+	// огромное смещение и тень «отрывается» от объекта (слайд 20)
+	raster.DepthBiasClamp        = 0.01f;
+	// Смещение, пропорциональное наклону — основное средство против acne
+	raster.SlopeScaledDepthBias  = 1.8f;
+	raster.DepthClipEnable       = TRUE;
+	raster.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+	D3D12_DEPTH_STENCIL_DESC ds = {};
+	ds.DepthEnable      = TRUE;
+	ds.DepthWriteMask   = D3D12_DEPTH_WRITE_MASK_ALL;
+	ds.DepthFunc        = D3D12_COMPARISON_FUNC_LESS;
+	ds.StencilEnable    = FALSE;
+	ds.StencilReadMask  = D3D12_DEFAULT_STENCIL_READ_MASK;
+	ds.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+	ds.FrontFace.StencilFailOp      = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilPassOp      = D3D12_STENCIL_OP_KEEP;
+	ds.FrontFace.StencilFunc        = D3D12_COMPARISON_FUNC_ALWAYS;
+	ds.BackFace = ds.FrontFace;
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+	pso.InputLayout           = { staticLayout, _countof(staticLayout) };
+	pso.pRootSignature        = m_shadowRootSig.Get();
+	pso.VS                    = { m_shadowVS->GetBufferPointer(), m_shadowVS->GetBufferSize() };
+	pso.PS                    = { nullptr, 0 };          // пиксельный шейдер не нужен
+	pso.RasterizerState       = raster;
+	pso.BlendState            = D3D12_BLEND_DESC{};
+	pso.DepthStencilState     = ds;
+	pso.SampleMask            = D3D12_DEFAULT_SAMPLE_MASK;
+	pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	pso.NumRenderTargets      = 0;                        // только глубина
+	pso.DSVFormat             = DXGI_FORMAT_D32_FLOAT;
+	pso.SampleDesc.Count      = 1;
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_shadowPSO)));
+
+	pso.InputLayout = { instancedLayout, _countof(instancedLayout) };
+	pso.VS          = { m_shadowVSInstanced->GetBufferPointer(), m_shadowVSInstanced->GetBufferSize() };
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_shadowPSOInstanced)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // PSO светового прохода: аддитивный блендинг, глубина выключена
 // (лекция 03, слайды 11 и 13)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -507,6 +644,8 @@ void RenderingSystem::BuildConstantBuffers(ID3D12Device* device)
 
 	m_materialCB = std::make_unique<UploadBuffer<MaterialConstants>>(device, matCount, true);
 	m_lightCB    = std::make_unique<UploadBuffer<LightConstants>>(device, lightCount, true);
+	m_shadowCB   = std::make_unique<UploadBuffer<ShadowPassConstants>>(device, ShadowMap::MaxCascades, true);
+	m_shadowCBStride = CalcConstantBufferByteSize(sizeof(ShadowPassConstants));
 
 	// Root CBV требует выравнивания адреса на 256 байт, поэтому шаг между
 	// элементами — тот же, что использует UploadBuffer при isConstantBuffer.
@@ -1069,7 +1208,8 @@ void RenderingSystem::Update(double dt,
                              const XMMATRIX& view,
                              const XMMATRIX& proj,
                              const XMFLOAT3& eyePos,
-                             UINT width, UINT height)
+                             UINT width, UINT height,
+                             float fovY, float aspect, float nearZ, float farZ)
 {
 	if (!m_objectCB) return;
 
@@ -1124,6 +1264,40 @@ void RenderingSystem::Update(double dt,
 		m_materialCB->CopyData(static_cast<int>(i), mc);
 	}
 
+	// ── Каскады теней ───────────────────────────────────────────────────────
+	// Направленный источник — единственный, который отбрасывает тени.
+	XMFLOAT3 sunDir = { 0.45f, -1.0f, 0.30f };
+	for (const LightConstants& l : m_lights)
+	{
+		if (l.Type == static_cast<uint32_t>(LightType::Directional))
+		{
+			sunDir = l.DirectionW;
+			break;
+		}
+	}
+
+	// Каскады строим не на всю дальнюю плоскость: сцена занимает считанные
+	// единицы, и растягивать карты теней на 100 единиц — терять разрешение.
+	const float shadowFar = std::min(farZ, 15.0f);
+	m_shadowMap.UpdateCascades(view, fovY, aspect, nearZ, shadowFar, sunDir);
+
+	// Константы прохода карты теней: по элементу на каскад
+	{
+		XMMATRIX world =
+			XMMatrixTranslation(-m_modelCenter.x, -m_modelCenter.y, -m_modelCenter.z) *
+			XMMatrixScaling(m_modelScale, m_modelScale, m_modelScale);
+
+		for (UINT c = 0; c < m_shadowMap.CascadeCount(); ++c)
+		{
+			XMMATRIX lvp = XMLoadFloat4x4(&m_shadowMap.LightViewProj(c));
+
+			ShadowPassConstants sc;
+			XMStoreFloat4x4(&sc.LightViewProj, XMMatrixTranspose(lvp));
+			XMStoreFloat4x4(&sc.World,         XMMatrixTranspose(world));
+			m_shadowCB->CopyData(static_cast<int>(c), sc);
+		}
+	}
+
 	// ── LightPassCB ─────────────────────────────────────────────────────────
 	LightPassConstants lp;
 	XMStoreFloat4x4(&lp.InvViewProj, XMMatrixTranspose(XMMatrixInverse(nullptr, viewProj)));
@@ -1131,6 +1305,21 @@ void RenderingSystem::Update(double dt,
 	lp.InvScreenSize = { 1.0f / static_cast<float>(width), 1.0f / static_cast<float>(height) };
 	lp.DebugMode     = m_debugMode;
 	lp.AmbientColor  = { 0.10f, 0.10f, 0.13f, 1.0f };
+
+	XMStoreFloat4x4(&lp.View, XMMatrixTranspose(view));
+	for (UINT c = 0; c < ShadowMap::MaxCascades; ++c)
+	{
+		// ShadowMap хранит матрицы в «математическом» виде, для HLSL их надо
+		// транспонировать — как и все остальные матрицы в константных буферах.
+		XMMATRIX m = XMLoadFloat4x4(&m_shadowMap.LightViewProj(c));
+		XMStoreFloat4x4(&lp.CascadeViewProj[c], XMMatrixTranspose(m));
+	}
+	lp.CascadeSplits   = m_shadowMap.SplitDistances();
+	lp.ShadowsEnabled  = m_shadowsEnabled ? 1u : 0u;
+	lp.ShowCascades    = m_showCascades   ? 1u : 0u;
+	lp.ShadowBias      = m_shadowBias;
+	lp.ShadowTexelSize = m_shadowMap.TexelSize();
+
 	m_lightPassCB->CopyData(0, lp);
 
 	// ── LightCB: перезаливаем только если менялась общая яркость ────────────
@@ -1153,7 +1342,77 @@ void RenderingSystem::Update(double dt,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Render — два прохода
+// RenderShadowPass — по проходу на каскад (лекция 06, слайд 30)
+//
+// Сцена рисуется столько раз, сколько каскадов, каждый раз со своей матрицей
+// ViewProj света и в свой срез массива. Материалы и текстуры не нужны — важна
+// только глубина.
+// ═════════════════════════════════════════════════════════════════════════════
+void RenderingSystem::RenderShadowPass(ID3D12GraphicsCommandList* cmd)
+{
+	if (!m_shadowsEnabled || !SceneLoaded() || !m_shadowCB)
+	{
+		// Даже если тени выключены, ресурс должен быть в состоянии для чтения:
+		// световой проход всё равно привяжет его как SRV.
+		m_shadowMap.TransitionToRead(cmd);
+		return;
+	}
+
+	m_shadowMap.TransitionToWrite(cmd);
+
+	// Viewport размером с КАРТУ, а не с окно (слайд 32)
+	const D3D12_VIEWPORT vp = m_shadowMap.Viewport();
+	const D3D12_RECT     sc = m_shadowMap.Scissor();
+	cmd->RSSetViewports(1, &vp);
+	cmd->RSSetScissorRects(1, &sc);
+
+	cmd->SetGraphicsRootSignature(m_shadowRootSig.Get());
+	cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+	const D3D12_GPU_VIRTUAL_ADDRESS cbBase = m_shadowCB->Resource()->GetGPUVirtualAddress();
+
+	for (UINT c = 0; c < m_shadowMap.CascadeCount(); ++c)
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE dsv = m_shadowMap.Dsv(c);
+
+		// Ни одного render target'а — пишем только глубину
+		cmd->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+		cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+		cmd->SetGraphicsRootConstantBufferView(
+			0, cbBase + static_cast<UINT64>(c) * m_shadowCBStride);
+
+		// ── Sponza ──────────────────────────────────────────────────────────
+		// Подмеши не разделяем: материалы для глубины не нужны, поэтому весь
+		// вершинный буфер рисуется одним вызовом.
+		cmd->SetPipelineState(m_shadowPSO.Get());
+		cmd->IASetVertexBuffers(0, 1, &m_modelVBV);
+		cmd->DrawInstanced(m_modelVertexCount, 1, 0, 0);
+
+		// ── Поле коробок ────────────────────────────────────────────────────
+		// Рисуем ВСЕ объекты, а не отобранные frustum culling'ом камеры:
+		// объект вне пирамиды камеры может отбрасывать тень внутрь неё.
+		if (m_objectField.TotalCount() > 0)
+		{
+			cmd->SetPipelineState(m_shadowPSOInstanced.Get());
+
+			D3D12_VERTEX_BUFFER_VIEW views[2] = {
+				m_objectField.CubeVBV(),
+				m_objectField.AllInstancesVBV()
+			};
+			cmd->IASetVertexBuffers(0, 2, views);
+			cmd->IASetIndexBuffer(&m_objectField.CubeIBV());
+
+			cmd->DrawIndexedInstanced(m_objectField.CubeIndexCount(),
+			                          m_objectField.TotalCount(), 0, 0, 0);
+		}
+	}
+
+	m_shadowMap.TransitionToRead(cmd);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Render — три прохода
 // ═════════════════════════════════════════════════════════════════════════════
 void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
                              D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv,
@@ -1161,6 +1420,11 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
                              const D3D12_VIEWPORT& viewport,
                              const D3D12_RECT& scissor)
 {
+	// ═══════════════════════════════════════════════════════════════════════
+	// ПРОХОД 0: Shadow Pass → заполняем каскады карты теней
+	// ═══════════════════════════════════════════════════════════════════════
+	RenderShadowPass(cmd);
+
 	cmd->RSSetViewports(1, &viewport);
 	cmd->RSSetScissorRects(1, &scissor);
 
@@ -1362,6 +1626,42 @@ void RenderingSystem::SetCullMode(CullMode mode)
 		(mode == CullMode::BruteForce) ? "[CULL] Brute force frustum culling\n" :
 		                                 "[CULL] Frustum culling + octree\n";
 	OutputDebugStringA(name);
+}
+
+void RenderingSystem::ToggleShadows()
+{
+	m_shadowsEnabled = !m_shadowsEnabled;
+	OutputDebugStringA(m_shadowsEnabled ? "[SHADOW] ON\n" : "[SHADOW] OFF\n");
+}
+
+void RenderingSystem::ToggleCascadeView()
+{
+	m_showCascades = !m_showCascades;
+	OutputDebugStringA(m_showCascades ? "[SHADOW] Cascade tint ON\n" : "[SHADOW] Cascade tint OFF\n");
+}
+
+void RenderingSystem::ScaleShadowBias(float factor)
+{
+	m_shadowBias *= factor;
+	m_shadowBias = std::max(0.0f, std::min(m_shadowBias, 0.05f));
+
+#if defined(_DEBUG)
+	char buf[64];
+	sprintf_s(buf, "[SHADOW] Bias = %.5f\n", m_shadowBias);
+	OutputDebugStringA(buf);
+#endif
+}
+
+void RenderingSystem::ScaleCascadeLambda(float delta)
+{
+	m_shadowMap.SetLambda(m_shadowMap.Lambda() + delta);
+
+#if defined(_DEBUG)
+	char buf[80];
+	sprintf_s(buf, "[SHADOW] Cascade lambda = %.2f (0 = uniform, 1 = logarithmic)\n",
+	          m_shadowMap.Lambda());
+	OutputDebugStringA(buf);
+#endif
 }
 
 void RenderingSystem::ToggleFrustumFreeze()

@@ -30,8 +30,14 @@ public:
 		RT_Count    = 3
 	};
 
-	// Число SRV в куче: 3 таргета + глубина
-	static constexpr UINT SrvCount = RT_Count + 1;
+	// Число SRV в куче: 3 таргета + глубина + массив каскадов теней (t4).
+	// Тени лежат здесь же, потому что одновременно можно привязать только одну
+	// кучу типа CBV_SRV_UAV — держим все ресурсы светового прохода в ней.
+	static constexpr UINT SrvCount = RT_Count + 2;
+
+	// Записывает дескриптор карты теней в слот t4. Вызывается один раз после
+	// создания ShadowMap; Resize() трогает только слоты t0..t3.
+	void SetShadowSrv(ID3D12Device* device, ID3D12Resource* shadowArray, UINT cascadeCount);
 
 	static DXGI_FORMAT Format(UINT index);
 

@@ -14,10 +14,16 @@
 // depth buffer and the inverse view-projection matrix (slide 17).
 //=============================================================================
 
-Texture2D<float4> gAlbedo   : register(t0);
-Texture2D<float4> gNormal   : register(t1);
-Texture2D<float4> gSpecular : register(t2);
-Texture2D<float>  gDepth    : register(t3);
+Texture2D<float4>      gAlbedo    : register(t0);
+Texture2D<float4>      gNormal    : register(t1);
+Texture2D<float4>      gSpecular  : register(t2);
+Texture2D<float>       gDepth     : register(t3);
+Texture2DArray<float>  gShadowMap : register(t4);   // one slice per cascade
+
+// Comparison sampler (lecture 06, slide 40): SampleCmp compares the value
+// passed from the shader against every fetched texel and blends the 0/1
+// results, which gives hardware 2x2 PCF for free.
+SamplerComparisonState gShadowSampler : register(s0);
 
 cbuffer LightPassCB : register(b0)
 {
@@ -31,6 +37,16 @@ cbuffer LightPassCB : register(b0)
     float  _lpPad1;
 
     float4 gAmbientColor;
+
+    // cascaded shadow maps
+    float4x4 gView;
+    float4x4 gCascadeViewProj[4];
+    float4   gCascadeSplits;      // far plane of each cascade, in view space
+
+    uint  gShadowsEnabled;
+    uint  gShowCascades;
+    float gShadowBias;
+    float gShadowTexelSize;
 };
 
 cbuffer LightCB : register(b1)
@@ -81,6 +97,89 @@ float3 ReconstructWorldPos(float2 pixelXY, float depth)
     float4 worldPos = mul(clipPos, gInvViewProj);
 
     return worldPos.xyz / worldPos.w;
+}
+
+//-----------------------------------------------------------------------------
+// Cascade selection (lecture 06, slide 31).
+//
+// The split distances are stored in view space, so the pixel depth has to be
+// taken in view space too - not the [0..1] value from the depth buffer.
+//-----------------------------------------------------------------------------
+uint SelectCascade(float3 posW)
+{
+    float viewZ = mul(float4(posW, 1.0f), gView).z;
+
+    uint cascade = 0;
+    if (viewZ > gCascadeSplits.x) cascade = 1;
+    if (viewZ > gCascadeSplits.y) cascade = 2;
+    if (viewZ > gCascadeSplits.z) cascade = 3;
+
+    return cascade;
+}
+
+//-----------------------------------------------------------------------------
+// Percentage Closer Filtering (slide 39): the depth COMPARISONS are averaged,
+// not the depths themselves. Averaging depths first and comparing once would
+// just move the hard edge, not soften it.
+//
+// 3x3 taps of SampleCmpLevelZero, and each tap is already bilinear 2x2 thanks
+// to the comparison sampler - so this is effectively a 4x4 kernel.
+//-----------------------------------------------------------------------------
+// Single exit point on purpose: with an early "return" inside the bounds check
+// fxc's flow analysis emits X4000 "potentially uninitialized variable", even
+// though every path does return a value.
+float SampleShadow(float3 posW, uint cascade)
+{
+    // Default is "lit": that is also the answer outside the cascade
+    float shadow = 1.0f;
+
+    float4 lightClip = mul(float4(posW, 1.0f), gCascadeViewProj[cascade]);
+
+    // Orthographic projection, so w is always 1 - divide anyway for generality
+    float3 ndc = lightClip.xyz / lightClip.w;
+
+    // NDC -> shadow map UV
+    float2 uv = ndc.xy * float2(0.5f, -0.5f) + 0.5f;
+
+    bool inside = (uv.x >= 0.0f) && (uv.x <= 1.0f) &&
+                  (uv.y >= 0.0f) && (uv.y <= 1.0f) &&
+                  (ndc.z <= 1.0f);
+
+    if (inside)
+    {
+        float compareDepth = ndc.z - gShadowBias;
+        float sum = 0.0f;
+
+        [unroll]
+        for (int y = -1; y <= 1; ++y)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; ++x)
+            {
+                float2 offset = float2(x, y) * gShadowTexelSize;
+                sum += gShadowMap.SampleCmpLevelZero(
+                    gShadowSampler,
+                    float3(uv + offset, cascade),
+                    compareDepth);
+            }
+        }
+
+        shadow = sum / 9.0f;
+    }
+
+    return shadow;
+}
+
+// Tint used by the cascade debug view. Single exit point, same reason as above.
+float3 CascadeColor(uint cascade)
+{
+    float3 color = float3(1.0f, 1.0f, 0.4f);            // cascade 3
+
+    if      (cascade == 0) color = float3(1.0f, 0.4f, 0.4f);
+    else if (cascade == 1) color = float3(0.4f, 1.0f, 0.4f);
+    else if (cascade == 2) color = float3(0.4f, 0.6f, 1.0f);
+
+    return color;
 }
 
 float4 PS(float4 posH : SV_POSITION) : SV_Target
@@ -141,6 +240,18 @@ float4 PS(float4 posH : SV_POSITION) : SV_Target
 
     float  nDotL   = saturate(dot(N, L));
     float3 radiance = gLightColor * gIntensity * attenuation;
+
+    // Only the directional light casts shadows here: cascades are built for an
+    // orthographic projection. A point light would need a cube map and a spot
+    // light its own perspective map (slide 13).
+    if (gShadowsEnabled != 0 && gLightType == LIGHT_DIRECTIONAL)
+    {
+        uint cascade = SelectCascade(posW);
+        radiance *= SampleShadow(posW, cascade);
+
+        if (gShowCascades != 0)
+            radiance *= CascadeColor(cascade);
+    }
 
     float3 diffuse = albedo * radiance * nDotL;
 

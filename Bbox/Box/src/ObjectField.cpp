@@ -114,6 +114,27 @@ void ObjectField::Init(ID3D12Device* device,
 	m_instanceVBV.StrideInBytes  = sizeof(InstanceData);
 	m_instanceVBV.SizeInBytes    = static_cast<UINT>(instBytes);
 
+	// Статическая копия со всеми объектами — используется проходом карты теней
+	{
+		m_allInstancesBuffer = CreateUploadBufferRaw(device, instBytes);
+
+		InstanceData* mapped = nullptr;
+		ThrowIfFailed(m_allInstancesBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
+
+		for (size_t i = 0; i < m_objectBounds.size(); ++i)
+		{
+			mapped[i].Center = m_objectBounds[i].Center();
+			mapped[i].Extent = m_objectBounds[i].Extent();
+			mapped[i].Color  = m_objectColors[i];
+		}
+
+		m_allInstancesBuffer->Unmap(0, nullptr);
+
+		m_allInstancesVBV.BufferLocation = m_allInstancesBuffer->GetGPUVirtualAddress();
+		m_allInstancesVBV.StrideInBytes  = sizeof(InstanceData);
+		m_allInstancesVBV.SizeInBytes    = static_cast<UINT>(instBytes);
+	}
+
 	BuildNodeBoxInstances();
 
 	// Коробки узлов статичны — заливаем один раз

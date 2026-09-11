@@ -13,6 +13,9 @@
 
 #include <Windows.h>
 
+// DirectXMath is used across the whole project - include it centrally.
+#include <DirectXMath.h>
+
 #include <wrl.h>
 #include <dxgi1_6.h>
 #include <d3d12.h>
@@ -70,7 +73,11 @@ inline ComPtr<ID3DBlob> CompileShader(
     {
         const char* msg = (const char*)errors->GetBufferPointer();
         OutputDebugStringA(msg);
-        MessageBoxA(nullptr, msg, "HLSL Compile Error", MB_OK | MB_ICONERROR);
+
+        // errors is filled for warnings too, not only for real failures.
+        // Modal box only when the compile actually failed.
+        if (FAILED(hr))
+            MessageBoxA(nullptr, msg, "HLSL Compile Error", MB_OK | MB_ICONERROR);
     }
 
     if (FAILED(hr))

@@ -134,6 +134,7 @@
     <ClCompile Include="src\ObjectField.cpp" />
     <ClCompile Include="src\Octree.cpp" />
     <ClCompile Include="src\RenderingSystem.cpp" />
+    <ClCompile Include="src\ShadowMap.cpp" />
     <ClCompile Include="src\Timer.cpp" />
     <ClCompile Include="src\Window.cpp" />
     <ClCompile Include="src\winMain.cpp" />
@@ -149,6 +150,7 @@
     <ClInclude Include="include\Octree.hpp" />
     <ClInclude Include="include\RenderingSystem.hpp" />
     <ClInclude Include="include\RenderStructs.hpp" />
+    <ClInclude Include="include\ShadowMap.hpp" />
     <ClInclude Include="include\Timer.hpp" />
     <ClInclude Include="include\tiny_obj_loader.h" />
     <ClInclude Include="include\UploadBuffer.hpp" />
@@ -159,6 +161,9 @@
       <FileType>Document</FileType>
     </None>
     <None Include="shader\Instanced.hlsl">
+      <FileType>Document</FileType>
+    </None>
+    <None Include="shader\ShadowPass.hlsl">
       <FileType>Document</FileType>
     </None>
     <None Include="shader\LightPass.hlsl">

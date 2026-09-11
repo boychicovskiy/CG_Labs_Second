@@ -68,6 +68,16 @@ public:
 
 	const CullStats& Stats() const { return m_stats; }
 
+	// ── Доступ для прохода карты теней (ДЗ №5) ──────────────────────────────
+	// В карту теней рисуются ВСЕ объекты, а не отобранные отсечением: объект
+	// вне пирамиды камеры вполне может отбрасывать тень внутрь неё.
+	// PSO и root signature ставит вызывающая сторона.
+	const D3D12_VERTEX_BUFFER_VIEW& CubeVBV()        const { return m_cubeVBV; }
+	const D3D12_VERTEX_BUFFER_VIEW& AllInstancesVBV() const { return m_allInstancesVBV; }
+	const D3D12_INDEX_BUFFER_VIEW&  CubeIBV()        const { return m_cubeIBV; }
+	UINT CubeIndexCount() const { return m_cubeIndexCount; }
+	UINT TotalCount()     const { return static_cast<UINT>(m_objectBounds.size()); }
+
 	void ToggleNodeBoxes();
 	bool NodeBoxesVisible() const { return m_showNodeBoxes; }
 
@@ -94,6 +104,10 @@ private:
 	InstanceData*            m_instanceMapped = nullptr;
 	UINT                     m_instanceCapacity = 0;
 	UINT                     m_visibleCount = 0;
+
+	// Статический буфер со ВСЕМИ объектами — для прохода карты теней
+	ComPtr<ID3D12Resource>   m_allInstancesBuffer;
+	D3D12_VERTEX_BUFFER_VIEW m_allInstancesVBV{};
 
 	// Отдельный буфер под отладочные коробки узлов дерева
 	ComPtr<ID3D12Resource>    m_nodeBoxBuffer;

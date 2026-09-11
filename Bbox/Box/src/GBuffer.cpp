@@ -127,6 +127,29 @@ void GBuffer::Resize(ID3D12Device* device, UINT width, UINT height, ID3D12Resour
 	}
 }
 
+void GBuffer::SetShadowSrv(ID3D12Device* device, ID3D12Resource* shadowArray, UINT cascadeCount)
+{
+	if (!m_srvHeap || !shadowArray) return;
+
+	D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+	handle.ptr += static_cast<SIZE_T>(RT_Count + 1) * m_srvSize;   // слот t4
+
+	// Ресурс создан как R32_TYPELESS: DSV читает его как D32_FLOAT,
+	// а этот SRV — как R32_FLOAT.
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+	srv.Format                           = DXGI_FORMAT_R32_FLOAT;
+	srv.ViewDimension                    = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+	srv.Shader4ComponentMapping          = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Texture2DArray.MostDetailedMip   = 0;
+	srv.Texture2DArray.MipLevels         = 1;
+	srv.Texture2DArray.FirstArraySlice   = 0;
+	srv.Texture2DArray.ArraySize         = cascadeCount;
+	srv.Texture2DArray.PlaneSlice        = 0;
+	srv.Texture2DArray.ResourceMinLODClamp = 0.0f;
+
+	device->CreateShaderResourceView(shadowArray, &srv, handle);
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::RtvStart() const
 {
 	return m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
