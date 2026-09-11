@@ -110,6 +110,12 @@ void RenderingSystem::Init(ID3D12Device* device,
 		region.Max = { +2.5f * std::max(halfX, 0.5f), +2.5f * std::max(halfY, 0.5f), +2.5f * std::max(halfZ, 0.5f) };
 
 		m_objectField.Init(device, region, /*objectCount*/ 4096, m_depthStencilFormat);
+
+		// ── ДЗ №6: фонтан частиц у пола атриума ─────────────────────────────
+		const DirectX::XMFLOAT3 emitter = { 0.0f, -halfY + 0.02f, 0.0f };
+		const float sceneScale = 2.0f * std::max(halfY, 0.25f);
+
+		m_particles.Init(device, emitter, sceneScale, m_depthStencilFormat);
 	}
 }
 
@@ -1330,6 +1336,9 @@ void RenderingSystem::Update(double dt,
 		m_lightCB->CopyData(static_cast<int>(i), lc);
 	}
 
+	// ── ДЗ №6: константы системы частиц ─────────────────────────────────────
+	m_particles.Update(dt, view, viewProj);
+
 	// ── ДЗ №4: отсечение поля объектов ──────────────────────────────────────
 	// Запоминаем последнюю матрицу, чтобы было что «заморозить».
 	XMStoreFloat4x4(&m_lastViewProj, viewProj);
@@ -1421,7 +1430,13 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
                              const D3D12_RECT& scissor)
 {
 	// ═══════════════════════════════════════════════════════════════════════
-	// ПРОХОД 0: Shadow Pass → заполняем каскады карты теней
+	// ПРОХОД 0a: Compute → эмиссия и интегрирование частиц (ДЗ №6)
+	// Обязательно до графических проходов: они читают результат.
+	// ═══════════════════════════════════════════════════════════════════════
+	m_particles.Simulate(cmd);
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// ПРОХОД 0b: Shadow Pass → заполняем каскады карты теней
 	// ═══════════════════════════════════════════════════════════════════════
 	RenderShadowPass(cmd);
 
@@ -1495,6 +1510,10 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 	// источниками света. Оно меняет root signature и PSO, но световой проход
 	// ниже всё равно ставит свои.
 	m_objectField.Render(cmd);
+
+	// Частицы непрозрачные и пишутся в тот же G-Buffer, поэтому их освещает
+	// общий световой проход. Рисуем последними в проходе геометрии.
+	m_particles.Render(cmd);
 
 	// ═══════════════════════════════════════════════════════════════════════
 	// ПРОХОД 2: Light Stage → аккумулируем освещение в back buffer

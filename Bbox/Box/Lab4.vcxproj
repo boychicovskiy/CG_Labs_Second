@@ -133,6 +133,7 @@
     <ClCompile Include="src\GBuffer.cpp" />
     <ClCompile Include="src\ObjectField.cpp" />
     <ClCompile Include="src\Octree.cpp" />
+    <ClCompile Include="src\ParticleSystem.cpp" />
     <ClCompile Include="src\RenderingSystem.cpp" />
     <ClCompile Include="src\ShadowMap.cpp" />
     <ClCompile Include="src\Timer.cpp" />
@@ -148,6 +149,7 @@
     <ClInclude Include="include\GBuffer.hpp" />
     <ClInclude Include="include\ObjectField.hpp" />
     <ClInclude Include="include\Octree.hpp" />
+    <ClInclude Include="include\ParticleSystem.hpp" />
     <ClInclude Include="include\RenderingSystem.hpp" />
     <ClInclude Include="include\RenderStructs.hpp" />
     <ClInclude Include="include\ShadowMap.hpp" />
@@ -161,6 +163,12 @@
       <FileType>Document</FileType>
     </None>
     <None Include="shader\Instanced.hlsl">
+      <FileType>Document</FileType>
+    </None>
+    <None Include="shader\ParticleCompute.hlsl">
+      <FileType>Document</FileType>
+    </None>
+    <None Include="shader\ParticleRender.hlsl">
       <FileType>Document</FileType>
     </None>
     <None Include="shader\ShadowPass.hlsl">

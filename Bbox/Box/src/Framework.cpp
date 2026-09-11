@@ -376,6 +376,12 @@ void Framework::HandleKeyboardShortcuts()
 	if (JustPressed('L')) m_renderer->ScaleShadowBias(1.33f);
 	if (JustPressed('U')) m_renderer->ScaleCascadeLambda(-0.05f);
 	if (JustPressed('I')) m_renderer->ScaleCascadeLambda(+0.05f);
+
+	// ── ДЗ №6: система частиц ───────────────────────────────────────────────
+	if (JustPressed('J')) m_renderer->ToggleParticles();
+	if (JustPressed('R')) m_renderer->ResetParticles();
+	if (JustPressed('Z')) m_renderer->ScaleEmission(0.7f);
+	if (JustPressed('X')) m_renderer->ScaleEmission(1.4f);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

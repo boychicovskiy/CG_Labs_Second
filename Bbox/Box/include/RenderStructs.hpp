@@ -74,6 +74,42 @@ struct alignas(16) InstancePassConstants {
 	DirectX::XMFLOAT4X4 ViewProj = dx::Identity4x4();
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// СИСТЕМА ЧАСТИЦ (ДЗ №6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Частица на GPU. Ровно 64 байта — должна совпадать со struct Particle в HLSL.
+struct GpuParticle {
+	DirectX::XMFLOAT3 Position; float Age;
+	DirectX::XMFLOAT3 Velocity; float Lifetime;
+	DirectX::XMFLOAT4 Color;
+	float             Size;     float _pad0, _pad1, _pad2;
+};
+
+// b0 для compute- и графического проходов частиц
+struct alignas(16) ParticleConstants {
+	DirectX::XMFLOAT4X4 ViewProj = dx::Identity4x4();
+
+	DirectX::XMFLOAT3 CameraRight = { 1.0f, 0.0f, 0.0f };
+	float             DeltaTime   = 0.0f;
+
+	DirectX::XMFLOAT3 CameraUp    = { 0.0f, 1.0f, 0.0f };
+	float             TotalTime   = 0.0f;
+
+	DirectX::XMFLOAT3 EmitterPos  = { 0.0f, 0.0f, 0.0f };
+	uint32_t          EmitCount   = 0;
+
+	DirectX::XMFLOAT3 Gravity     = { 0.0f, -0.45f, 0.0f };
+	uint32_t          FrameIndex  = 0;
+
+	float LifeMin = 1.6f, LifeMax = 3.2f;
+	float SpeedMin = 0.25f, SpeedMax = 0.75f;
+
+	float SizeMin = 0.004f, SizeMax = 0.012f;
+	float Drag = 0.35f;
+	uint32_t MaxParticles = 0;
+};
+
 // b0 прохода карты теней (ДЗ №5). Один элемент на каскад.
 struct alignas(16) ShadowPassConstants {
 	DirectX::XMFLOAT4X4 LightViewProj = dx::Identity4x4();

@@ -12,6 +12,7 @@
 #include "GBuffer.hpp"
 #include "ObjectField.hpp"
 #include "ShadowMap.hpp"
+#include "ParticleSystem.hpp"
 
 // Диапазон вершин с одним материалом
 struct SubMesh {
@@ -117,6 +118,11 @@ public:
 	void ScaleShadowBias(float factor);
 	void ScaleCascadeLambda(float delta);
 	bool ShadowsEnabled() const { return m_shadowsEnabled; }
+
+	// ── ДЗ №6 ───────────────────────────────────────────────────────────────
+	void ToggleParticles()      { m_particles.ToggleEnabled(); }
+	void ResetParticles()       { m_particles.Reset(); }
+	void ScaleEmission(float f) { m_particles.ScaleEmissionRate(f); }
 
 	const CullStats& FieldStats()   const { return m_objectField.Stats(); }
 	size_t OctreeNodeCount()        const { return m_objectField.OctreeNodeCount(); }
@@ -244,7 +250,8 @@ private:
 	CullMode    m_cullMode = CullMode::Octree;
 
 	// ── Каскадные тени (ДЗ №5) ──────────────────────────────────────────────
-	ShadowMap m_shadowMap;
+	ShadowMap      m_shadowMap;
+	ParticleSystem m_particles;
 	bool      m_shadowsEnabled = true;
 	bool      m_showCascades   = false;
 	float     m_shadowBias     = 0.0018f;
