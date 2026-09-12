@@ -156,28 +156,36 @@ float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness)
 // texture fetches are replaced by closed-form functions.
 //=============================================================================
 
-// Radiance arriving from direction dir. gAmbientColor is the zenith color.
+// Radiance arriving from direction dir. gAmbientColor is the zenith color and
+// sets the overall level; everything else is derived from it so that one slider
+// controls the whole environment.
+//
+// The horizon step is deliberately sharp: with a smooth gradient every metal
+// surface reflects almost the same value and the whole object field collapses
+// into flat pastel rectangles. A visible horizon gives metals something to show.
 float3 SkyRadiance(float3 dir)
 {
     float3 zenith  = gAmbientColor.rgb;
-    float3 horizon = saturate(gAmbientColor.rgb * 1.5f + 0.08f);
-    float3 ground  = float3(0.10f, 0.09f, 0.08f);
+    float3 horizon = gAmbientColor.rgb * 1.35f + 0.02f;
+    float3 ground  = gAmbientColor.rgb * 0.22f;
 
     float3 above = lerp(horizon, zenith, saturate(dir.y));
-    return lerp(ground, above, saturate(dir.y * 3.0f + 0.5f));
+    return lerp(ground, above, saturate(dir.y * 6.0f + 0.5f));
 }
 
 // Cosine-weighted convolution of that sky over the hemisphere around N.
 // For a gradient this smooth the integral collapses into another gradient,
 // which is what an irradiance map would have stored (slide 52).
+//
+// The up/down contrast is what makes ambient look like light and not like fog:
+// a surface facing the sky gets roughly five times what a downward-facing one
+// gets. A flat value here washes out every shape in the scene.
 float3 SkyIrradiance(float3 N)
 {
-    float3 zenith  = gAmbientColor.rgb;
-    float3 horizon = saturate(gAmbientColor.rgb * 1.3f + 0.05f);
-    float3 ground  = float3(0.09f, 0.08f, 0.07f);
+    float3 sky    = gAmbientColor.rgb * 1.15f;
+    float3 ground = gAmbientColor.rgb * 0.20f;
 
-    float3 above = lerp(horizon, zenith, saturate(N.y));
-    return lerp(ground, above, N.y * 0.5f + 0.5f);
+    return lerp(ground, sky, N.y * 0.5f + 0.5f);
 }
 
 // Prefiltered environment map stand-in: a rough surface reflects a wide lobe,

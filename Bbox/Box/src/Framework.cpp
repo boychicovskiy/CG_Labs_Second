@@ -405,6 +405,8 @@ void Framework::HandleKeyboardShortcuts()
 	if (JustPressed('V'))          m_renderer->ToggleIbl();
 	if (JustPressed(VK_OEM_1))     m_renderer->ScaleRoughness(0.8f);    // ;
 	if (JustPressed(VK_OEM_7))     m_renderer->ScaleRoughness(1.25f);   // '
+	if (JustPressed('Y'))          m_renderer->ScaleAmbient(0.8f);
+	if (JustPressed(VK_OEM_2))     m_renderer->ScaleAmbient(1.25f);     // /
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -435,10 +437,10 @@ void Framework::UpdateWindowTitle(double dt)
 	const wchar_t* ibl = m_renderer->IblEnabled() ? L"IBL" : L"flat";
 
 	wchar_t buf[384];
-	swprintf_s(buf, L"CG Lab  |  %.0f FPS  |  cull: %s  |  drawn %u / %u  |  AABB tests %u  |  %.3f ms  |  octree %zu nodes, depth %d  |  ambient: %s  |  rough x%.2f%s",
+	swprintf_s(buf, L"CG Lab  |  %.0f FPS  |  cull: %s  |  drawn %u / %u  |  AABB tests %u  |  %.3f ms  |  octree %zu nodes, depth %d  |  ambient: %s x%.2f  |  rough x%.2f%s",
 	           fps, modeName, s.drawnObjects, s.totalObjects, s.aabbTests, s.cullMs,
 	           m_renderer->OctreeNodeCount(), m_renderer->OctreeDepth(),
-	           ibl, m_renderer->RoughnessScale(), frozen);
+	           ibl, m_renderer->AmbientScale(), m_renderer->RoughnessScale(), frozen);
 
 	if (HWND hwnd = MainWnd())
 		SetWindowTextW(hwnd, buf);

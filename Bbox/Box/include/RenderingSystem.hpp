@@ -135,8 +135,10 @@ public:
 
 	// ── Лаба 8: PBR ─────────────────────────────────────────────────────────
 	void  ScaleRoughness(float factor);
+	void  ScaleAmbient(float factor);
 	void  ToggleIbl();
 	float RoughnessScale() const { return m_roughnessScale; }
+	float AmbientScale()   const { return m_ambientScale; }
 	bool  IblEnabled()     const { return m_iblEnabled; }
 
 	const CullStats& FieldStats()   const { return m_objectField.Stats(); }
@@ -257,6 +259,7 @@ private:
 
 	// ── PBR (лаба 8) ────────────────────────────────────────────────────────
 	float m_roughnessScale = 1.0f;   // глобальный множитель к roughness
+	float m_ambientScale   = 1.0f;   // глобальный множитель к яркости окружения
 	bool  m_iblEnabled     = true;   // аналитическое окружение вместо ambient
 
 	float m_displacementScale = 0.008f;

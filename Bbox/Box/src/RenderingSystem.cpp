@@ -1379,9 +1379,16 @@ void RenderingSystem::Update(double dt,
 	lp.IblEnabled    = m_iblEnabled ? 1u : 0u;
 
 	// Лаба 8: ambient больше не «плоская добавка» вида float3(0.03)*albedo
-	// (слайд 53), а цвет неба, от которого световой проход строит
+	// (слайд 53), а цвет ЗЕНИТА неба, от которого световой проход строит
 	// аналитическое окружение: облучённость + отражение (слайды 53-56, 80).
-	lp.AmbientColor  = { 0.32f, 0.42f, 0.62f, 1.0f };
+	//
+	// Уровень подобран относительно направленного источника (интенсивность
+	// 0.55): облучённость от неба должна быть примерно втрое слабее солнца.
+	// Если сделать её сопоставимой, прямой свет перестаёт читаться, тени
+	// исчезают, а металлы превращаются в плоские пастельные пятна.
+	lp.AmbientColor  = { 0.11f * m_ambientScale,
+	                     0.14f * m_ambientScale,
+	                     0.21f * m_ambientScale, 1.0f };
 
 	XMStoreFloat4x4(&lp.View, XMMatrixTranspose(view));
 	for (UINT c = 0; c < ShadowMap::MaxCascades; ++c)
@@ -1717,6 +1724,18 @@ void RenderingSystem::ScaleRoughness(float factor)
 #if defined(_DEBUG)
 	char buf[64];
 	sprintf_s(buf, "[PBR] Roughness scale = %.2f\n", m_roughnessScale);
+	OutputDebugStringA(buf);
+#endif
+}
+
+void RenderingSystem::ScaleAmbient(float factor)
+{
+	m_ambientScale *= factor;
+	m_ambientScale = std::max(0.05f, std::min(m_ambientScale, 8.0f));
+
+#if defined(_DEBUG)
+	char buf[64];
+	sprintf_s(buf, "[PBR] Ambient scale = %.2f\n", m_ambientScale);
 	OutputDebugStringA(buf);
 #endif
 }
