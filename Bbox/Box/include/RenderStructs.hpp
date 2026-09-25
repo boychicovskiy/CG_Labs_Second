@@ -199,6 +199,14 @@ struct alignas(16) LightPassConstants {
 	uint32_t ShowCascades    = 0;    // подкрасить каскады разными цветами
 	float    ShadowBias      = 0.0018f;
 	float    ShadowTexelSize = 1.0f / 2048.0f;
+
+	// ── Доп. задание лабы 2: миниатюры G-Buffer в углу экрана (слайд 22) ────
+	// Полоса, в которую вписаны плитки: xy — левый верхний угол в пикселях,
+	// zw — ширина и высота. Пиксельный шейдер по ним определяет, в какую
+	// плитку попал пиксель и какие UV ему соответствуют.
+	DirectX::XMFLOAT4 DebugStrip     = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint32_t          DebugTileCount = 4;
+	uint32_t          _pad2 = 0, _pad3 = 0, _pad4 = 0;
 };
 
 static_assert(sizeof(Vertex)              == 48,     "Vertex stride must stay 48 bytes.");

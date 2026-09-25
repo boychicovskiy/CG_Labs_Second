@@ -52,6 +52,12 @@ cbuffer LightPassCB : register(b0)
     uint  gShowCascades;
     float gShadowBias;
     float gShadowTexelSize;
+
+    // Extra task (slide 22): G-Buffer thumbnails in the corner of the screen.
+    // xy = top-left of the strip in pixels, zw = its width and height.
+    float4 gDebugStrip;
+    uint   gDebugTileCount;
+    uint   _lpPad2, _lpPad3, _lpPad4;
 };
 
 cbuffer LightCB : register(b1)
@@ -494,4 +500,56 @@ float4 PS_Debug(float4 posH : SV_POSITION) : SV_Target
     }
 
     return float4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+
+//-----------------------------------------------------------------------------
+// Extra task (slide 22): "Отрисовка отладочной информации".
+//
+// All four G-Buffer channels at once, as small thumbnails in the bottom-left
+// corner. Drawn with the SAME fullscreen triangle as every other pass - the
+// viewport is simply shrunk down to the strip, so the triangle covers exactly
+// it and no extra geometry is needed.
+//
+// SV_POSITION still arrives in SCREEN pixels, not viewport-local ones, so the
+// position inside the strip is computed from gDebugStrip. The tile index is
+// then that normalised coordinate scaled by the tile count, which keeps the
+// whole overlay down to a SINGLE draw call.
+//-----------------------------------------------------------------------------
+float4 PS_DebugOverlay(float4 posH : SV_POSITION) : SV_Target
+{
+    // Position inside the strip, 0..1 across its full width and height
+    float2 t = (posH.xy - gDebugStrip.xy) / max(gDebugStrip.zw, 1e-4f);
+
+    float fx   = t.x * (float) gDebugTileCount;
+    int   tile = (int) floor(fx);
+
+    // frac() gives the coordinate inside the current tile
+    float2 uv = float2(frac(fx), t.y);
+
+    // Thin frame, otherwise neighbouring thumbnails blend into one another
+    float2 d = abs(uv - 0.5f);
+    if (max(d.x, d.y) > 0.5f - 0.012f)
+        return float4(0.02f, 0.02f, 0.02f, 1.0f);
+
+    // gInvScreen is 1/width, 1/height - dividing by it scales uv back to texels
+    int3 pixel = int3(uv / gInvScreen, 0);
+
+    if (tile == 0)
+        return float4(gAlbedo.Load(pixel).rgb, 1.0f);
+
+    if (tile == 1)
+    {
+        // Guard against normalize(0) on pixels the geometry pass never touched
+        float3 raw = gNormal.Load(pixel).xyz;
+        float3 n   = (dot(raw, raw) > 1e-6f) ? normalize(raw) : float3(0.0f, 0.0f, 0.0f);
+        return float4(n * 0.5f + 0.5f, 1.0f);
+    }
+
+    if (tile == 2)
+        return float4(gMaterial.Load(pixel).rgb, 1.0f);
+
+    // Depth is heavily non-linear; a power curve makes it readable
+    float depth = gDepth.Load(pixel);
+    float v     = pow(saturate(depth), 64.0f);
+    return float4(v, v, v, 1.0f);
 }

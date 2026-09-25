@@ -92,6 +92,10 @@ public:
 	void ResetUv();
 	void SetDebugMode(uint32_t mode);
 	uint32_t DebugMode() const { return m_debugMode; }
+
+	// Доп. задание лабы 2: миниатюры всех каналов G-Buffer в углу экрана
+	void ToggleDebugOverlay();
+	bool DebugOverlayEnabled() const { return m_debugOverlay; }
 	void ScaleLightIntensity(float factor);
 
 	// ── ДЗ №3 ───────────────────────────────────────────────────────────────
@@ -185,7 +189,7 @@ private:
 	// ── Шейдеры ─────────────────────────────────────────────────────────────
 	ComPtr<ID3DBlob> m_geoVS, m_geoPS;
 	ComPtr<ID3DBlob> m_geoVSTess, m_geoHS, m_geoDS;
-	ComPtr<ID3DBlob> m_lightVS, m_lightPS, m_debugPS;
+	ComPtr<ID3DBlob> m_lightVS, m_lightPS, m_debugPS, m_debugOverlayPS;
 	ComPtr<ID3DBlob> m_shadowVS, m_shadowVSInstanced;
 
 	// ── Root signatures / PSO ───────────────────────────────────────────────
@@ -198,6 +202,7 @@ private:
 	ComPtr<ID3D12PipelineState> m_tessPSOWire;   // VS→HS→DS→PS, wireframe
 	ComPtr<ID3D12PipelineState> m_lightPSO;
 	ComPtr<ID3D12PipelineState> m_debugPSO;
+	ComPtr<ID3D12PipelineState> m_debugOverlayPSO;   // миниатюры поверх кадра
 
 	ComPtr<ID3D12RootSignature> m_shadowRootSig;
 	ComPtr<ID3D12PipelineState> m_shadowPSO;           // статическая геометрия
@@ -249,6 +254,11 @@ private:
 	bool              m_uvAnimEnabled = false;
 
 	uint32_t m_debugMode = 0;
+
+	// ── Доп. задание лабы 2: миниатюры G-Buffer ─────────────────────────────
+	bool              m_debugOverlay = false;
+	DirectX::XMFLOAT4 m_debugStrip   = { 0.0f, 0.0f, 0.0f, 0.0f };   // x, y, w, h
+	static constexpr uint32_t kDebugTiles = 4;   // albedo, normal, material, depth
 
 	// ── Тесселяция и normal mapping (ДЗ №3) ─────────────────────────────────
 	bool  m_tessEnabled       = true;

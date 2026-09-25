@@ -159,6 +159,9 @@ void RenderingSystem::BuildShaders()
 	m_lightPS = CompileShader(lightFile, nullptr, "PS", "ps_5_1");
 	m_debugPS = CompileShader(lightFile, nullptr, "PS_Debug", "ps_5_1");
 
+	// Доп. задание: все каналы G-Buffer сразу, миниатюрами в углу экрана
+	m_debugOverlayPS = CompileShader(lightFile, nullptr, "PS_DebugOverlay", "ps_5_1");
+
 	// Проход карты теней — только вершинные шейдеры, пиксельного нет вовсе
 	const std::wstring shadowFile = L"shader\\ShadowPass.hlsl";
 	m_shadowVS          = CompileShader(shadowFile, nullptr, "VS",           "vs_5_1");
@@ -635,6 +638,14 @@ void RenderingSystem::BuildLightPSO(ID3D12Device* device)
 	pso.BlendState = opaque;
 
 	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_debugPSO)));
+
+	// Доп. задание: миниатюры G-Buffer рисуются ПОСЛЕ постобработки, прямо
+	// в бэк-буфер — иначе тональное отображение и bloom исказят отладочные
+	// данные. Отсюда другой формат цели: не HDR, а формат бэк-буфера.
+	pso.PS            = { m_debugOverlayPS->GetBufferPointer(), m_debugOverlayPS->GetBufferSize() };
+	pso.RTVFormats[0] = m_backBufferFormat;
+
+	ThrowIfFailed(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_debugOverlayPSO)));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1378,6 +1389,25 @@ void RenderingSystem::Update(double dt,
 	lp.DebugMode     = m_debugMode;
 	lp.IblEnabled    = m_iblEnabled ? 1u : 0u;
 
+	// ── Доп. задание лабы 2: геометрия полосы с миниатюрами ─────────────────
+	// Высота плитки — доля высоты экрана, ширина — по соотношению сторон окна,
+	// чтобы миниатюра не выглядела растянутой. Считается ЗДЕСЬ, а не в Render(),
+	// потому что те же числа уходят в константный буфер: шейдер и viewport
+	// обязаны исходить из одного и того же прямоугольника.
+	{
+		const float margin = 12.0f;
+		const float tileH  = 0.15f * static_cast<float>(height);
+		const float tileW  = tileH * (static_cast<float>(width) / static_cast<float>(height));
+
+		m_debugStrip.z = tileW * static_cast<float>(kDebugTiles);
+		m_debugStrip.w = tileH;
+		m_debugStrip.x = margin;
+		m_debugStrip.y = static_cast<float>(height) - margin - tileH;   // левый НИЖНИЙ угол
+
+		lp.DebugStrip     = m_debugStrip;
+		lp.DebugTileCount = kDebugTiles;
+	}
+
 	// Лаба 8: ambient больше не «плоская добавка» вида float3(0.03)*albedo
 	// (слайд 53), а цвет ЗЕНИТА неба, от которого световой проход строит
 	// аналитическое окружение: облучённость + отражение (слайды 53-56, 80).
@@ -1648,6 +1678,63 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmd,
 	// отображения и свечения — иначе нормали и глубина исказятся.
 	m_post.SetPassthrough(m_debugMode != 0);
 	m_post.Execute(cmd, backBufferRtv, viewport, scissor);
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// ПРОХОД 4 (доп. задание лабы 2, слайд 22): миниатюры каналов G-Buffer
+	// в левом нижнем углу.
+	//
+	// Рисуется ПОСЛЕ постобработки, прямо в бэк-буфер — отладочные данные
+	// не должны проходить через тональное отображение и bloom.
+	//
+	// Приём: тот же полноэкранный треугольник, что и в световом проходе,
+	// но viewport сжат до полосы в углу. Треугольник накрывает ровно её,
+	// а пиксельный шейдер по номеру плитки выбирает, какой таргет показать.
+	// Итог — ОДИН вызов отрисовки на все четыре миниатюры.
+	//
+	// G-Buffer всё ещё в состоянии PIXEL_SHADER_RESOURCE после
+	// TransitionToRead, поэтому дополнительных барьеров не требуется.
+	// ═══════════════════════════════════════════════════════════════════════
+	if (m_debugOverlay && m_debugMode == 0)
+	{
+		cmd->OMSetRenderTargets(1, &backBufferRtv, FALSE, nullptr);
+
+		// Постобработка привязывала свою сигнатуру и свою кучу дескрипторов —
+		// возвращаем ресурсы светового прохода
+		cmd->SetGraphicsRootSignature(m_lightRootSig.Get());
+		cmd->SetDescriptorHeaps(1, gbufHeaps);
+		cmd->SetGraphicsRootConstantBufferView(0, m_lightPassCB->Resource()->GetGPUVirtualAddress());
+		cmd->SetGraphicsRootConstantBufferView(1, lightCbBase);
+		cmd->SetGraphicsRootDescriptorTable(2, m_gbuffer.SrvGpuStart());
+
+		D3D12_VIEWPORT stripVp = {};
+		stripVp.TopLeftX = m_debugStrip.x;
+		stripVp.TopLeftY = m_debugStrip.y;
+		stripVp.Width    = m_debugStrip.z;
+		stripVp.Height   = m_debugStrip.w;
+		stripVp.MinDepth = 0.0f;
+		stripVp.MaxDepth = 1.0f;
+
+		D3D12_RECT stripSr = {};
+		stripSr.left   = static_cast<LONG>(m_debugStrip.x);
+		stripSr.top    = static_cast<LONG>(m_debugStrip.y);
+		stripSr.right  = static_cast<LONG>(m_debugStrip.x + m_debugStrip.z);
+		stripSr.bottom = static_cast<LONG>(m_debugStrip.y + m_debugStrip.w);
+
+		cmd->RSSetViewports(1, &stripVp);
+		cmd->RSSetScissorRects(1, &stripSr);
+
+		cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		cmd->IASetVertexBuffers(0, 1, nullptr);
+		cmd->IASetIndexBuffer(nullptr);
+
+		cmd->SetPipelineState(m_debugOverlayPSO.Get());
+		cmd->DrawInstanced(3, 1, 0, 0);
+
+		// Возвращаем полноэкранный viewport, иначе следующий кадр начнётся
+		// с обрезанной областью
+		cmd->RSSetViewports(1, &viewport);
+		cmd->RSSetScissorRects(1, &scissor);
+	}
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1675,6 +1762,12 @@ void RenderingSystem::ResetUv()
 void RenderingSystem::SetDebugMode(uint32_t mode)
 {
 	m_debugMode = (m_debugMode == mode) ? 0u : mode;   // повторное нажатие выключает
+}
+
+void RenderingSystem::ToggleDebugOverlay()
+{
+	m_debugOverlay = !m_debugOverlay;
+	OutputDebugStringA(m_debugOverlay ? "[GBUF] Overlay ON\n" : "[GBUF] Overlay OFF\n");
 }
 
 void RenderingSystem::ScaleLightIntensity(float factor)

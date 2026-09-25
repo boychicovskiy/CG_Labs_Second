@@ -352,6 +352,9 @@ void Framework::HandleKeyboardShortcuts()
 		if (JustPressed(static_cast<uint8_t>(VK_F1 + i)))
 			m_renderer->SetDebugMode(static_cast<uint32_t>(i + 1));
 
+	// F6 — доп. задание лабы 2: все каналы G-Buffer миниатюрами в углу
+	if (JustPressed(VK_F6)) m_renderer->ToggleDebugOverlay();
+
 	if (JustPressed(VK_OEM_PLUS))  m_renderer->ScaleLightIntensity(1.25f);
 	if (JustPressed(VK_OEM_MINUS)) m_renderer->ScaleLightIntensity(0.8f);
 
